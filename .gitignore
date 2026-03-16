@@ -1,0 +1,30 @@
+# Clojure
+.cpcache/
+.nrepl-port
+target/
+
+# ClojureScript / shadow-cljs
+.shadow-cljs/
+public/js/
+node_modules/
+
+# clj-kondo
+.clj-kondo/.cache/
+.clj-kondo/imports/
+
+# LSP
+.lsp/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
+.#*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Babashka
+.bb/

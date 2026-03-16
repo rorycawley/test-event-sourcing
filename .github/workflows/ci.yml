@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Clojure tooling
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+          bb: latest
+          clj-kondo: latest
+
+      - name: Verify Docker is available
+        run: docker info
+
+      - name: Lint
+        run: bb lint
+
+      - name: Smoke check
+        run: bb smoke
+
+      - name: Integration tests
+        run: bb test
+
+      - name: Coverage report and threshold gate
+        run: bb coverage
+
+      - name: Performance benchmark run
+        run: bb perf
+
+      - name: Publish performance summaries
+        if: always()
+        run: |
+          if [ -f target/perf/summary.md ]; then
+            cat target/perf/summary.md >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
