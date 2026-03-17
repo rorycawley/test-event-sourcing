@@ -157,6 +157,7 @@ src/
 │   ├── store.clj                #   Append-only event store (PostgreSQL)
 │   ├── projection.clj           #   Read model catch-up and rebuild
 │   ├── projection_kit.clj       #   Data-driven projection handler factories
+│   ├── saga.clj                 #   Reusable saga coordination helpers
 │   ├── schema.clj               #   Shared Malli schemas
 │   ├── migrations.clj           #   Migratus migration wrapper
 │   ├── migrations_cli.clj       #   CLI for running migrations against external DB
@@ -184,7 +185,9 @@ test/
 │   ├── fuzz_integration_test.clj#   Property-based integration tests (DB)
 │   ├── perf.clj                 #   Performance benchmarks
 │   ├── perf_check.clj           #   Regression detection vs baseline
+│   ├── perf_check_test.clj      #   Regression detection tests
 │   ├── perf_baseline.clj        #   Baseline management
+│   ├── perf_baseline_test.clj   #   Baseline management tests
 │   └── test_support.clj         #   Test fixtures and utilities
 ├── es/
 │   ├── decider_test.clj         #   Command handler tests (mocked store)
