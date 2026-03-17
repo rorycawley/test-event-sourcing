@@ -21,6 +21,7 @@
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [event-sourcing.account-projection]
+            [event-sourcing.transfer-projection]
             [event-sourcing.projection-dispatch :as projection-dispatch]
             [event-sourcing.store :as store]))
 
@@ -140,6 +141,7 @@
   (jdbc/with-transaction [tx ds]
     (lock-projection! tx)
     (jdbc/execute-one! tx ["DELETE FROM account_balances"])
+    (jdbc/execute-one! tx ["DELETE FROM transfer_status"])
     (jdbc/execute-one! tx ["DELETE FROM projection_checkpoints"])
     (let [all-events
           (mapv decode-event-row
@@ -170,4 +172,15 @@
       FROM account_balances
       WHERE account_id = ?"
                       account-id]
+                     {:builder-fn rs/as-unqualified-kebab-maps}))
+
+(defn get-transfer
+  "Reads the projected status for one transfer."
+  [ds transfer-id]
+  (jdbc/execute-one! ds
+                     ["SELECT transfer_id, from_account, to_account, amount,
+                             status, failure_reason, last_global_sequence, updated_at
+      FROM transfer_status
+      WHERE transfer_id = ?"
+                      transfer-id]
                      {:builder-fn rs/as-unqualified-kebab-maps}))

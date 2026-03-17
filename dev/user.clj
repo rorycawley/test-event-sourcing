@@ -22,22 +22,27 @@
    Step 6: Demonstrate optimistic concurrency conflict
    Step 7: Demonstrate idempotency
    Step 8: Demonstrate retry on conflict
-   Step 9: Tear down")
+   Step 9: Fund transfer saga (cross-account)
+   Step 10: Tear down")
 
 ;; ═══════════════════════════════════════════════════
 ;; Step 0 — Require namespaces
 ;; ═══════════════════════════════════════════════════
 ;;
-;; account  — pure domain (the Decider map, no I/O)
-;; decider  — generic Pull → Transform → Push handler
-;; store    — event store (Pull and Push)
+;; account   — pure account domain (the Decider map, no I/O)
+;; transfer  — pure transfer domain (the Decider map, no I/O)
+;; saga      — saga coordinator for cross-account transfers
+;; decider   — generic Pull → Transform → Push handler
+;; store     — event store (Pull and Push)
 ;; projection — read model
 
-(require '[event-sourcing.infra       :as infra]
-         '[event-sourcing.store       :as store]
-         '[event-sourcing.decider     :as decider]
-         '[event-sourcing.account     :as account]
-         '[event-sourcing.projection  :as projection])
+(require '[event-sourcing.infra          :as infra]
+         '[event-sourcing.store          :as store]
+         '[event-sourcing.decider        :as decider]
+         '[event-sourcing.account        :as account]
+         '[event-sourcing.projection     :as projection]
+         '[event-sourcing.transfer       :as transfer]
+         '[event-sourcing.transfer-saga  :as saga])
 
 ;; ═══════════════════════════════════════════════════
 ;; Step 1 — Start a throwaway Postgres
@@ -220,7 +225,70 @@
   (projection/get-balance ds "account-42")
 
   ;; ═══════════════════════════════════════════════════
-  ;; Step 9 — Tear down
+  ;; Step 9 — Fund transfer saga (cross-account)
+  ;; ═══════════════════════════════════════════════════
+  ;;
+  ;; The transfer saga coordinates a cross-account transfer
+  ;; using three streams:
+  ;;   1. Source account stream (debit)
+  ;;   2. Destination account stream (credit)
+  ;;   3. Transfer stream (saga progress tracking)
+  ;;
+  ;; First, open a second account:
+
+  (decider/handle! ds account/decider
+                   {:command-type    :open-account
+                    :stream-id       "account-99"
+                    :idempotency-key "cmd-open-99"
+                    :data            {:owner "Bob"}})
+
+  (decider/handle! ds account/decider
+                   {:command-type    :deposit
+                    :stream-id       "account-99"
+                    :idempotency-key "cmd-dep-99-200"
+                    :data            {:amount 200}})
+
+  ;; 9a. Execute a transfer from Alice to Bob:
+  (saga/execute! ds "tx-001" "account-42" "account-99" 40)
+  ;; => {:status :completed}
+
+  ;; Check balances after transfer:
+  (projection/process-new-events! ds)
+  (projection/get-balance ds "account-42")
+  ;; => {:balance 70, ...}  (was 110, minus 40)
+  (projection/get-balance ds "account-99")
+  ;; => {:balance 240, ...}  (was 200, plus 40)
+
+  ;; Inspect the transfer stream — tracks saga progress:
+  (mapv :event-type (store/load-stream ds "transfer-tx-001"))
+  ;; => ["transfer-initiated" "debit-recorded"
+  ;;     "credit-recorded" "transfer-completed"]
+
+  ;; View projected transfer status:
+  (projection/get-transfer ds "transfer-tx-001")
+  ;; => {:transfer-id "transfer-tx-001", :status "completed", ...}
+
+  ;; 9b. Transfer with insufficient funds fails gracefully:
+  (saga/execute! ds "tx-002" "account-42" "account-99" 9999)
+  ;; => {:status :failed, :reason "insufficient-funds"}
+
+  ;; Alice's balance unchanged:
+  (projection/process-new-events! ds)
+  (projection/get-balance ds "account-42")
+
+  ;; Transfer domain is also pure — test without a database:
+  (transfer/decide {:command-type :initiate-transfer
+                    :data         {:from-account "a" :to-account "b" :amount 50}}
+                   {:status :not-found})
+  ;; => [{:event-type "transfer-initiated", :payload {...}}]
+
+  (transfer/evolve {:status :not-found}
+                   {:event-type "transfer-initiated" :event-version 1
+                    :payload {:from-account "a" :to-account "b" :amount 50}})
+  ;; => {:status :initiated, :from-account "a", :to-account "b", :amount 50}
+
+  ;; ═══════════════════════════════════════════════════
+  ;; Step 10 — Tear down
   ;; ═══════════════════════════════════════════════════
 
   (infra/stop-postgres! pg)
@@ -253,4 +321,36 @@
     (catch clojure.lang.ExceptionInfo e
       (ex-data e)))
   ;; => {:balance 100, :amount 999}
+
+  ;; ═══════════════════════════════════════════════════
+  ;; Exploring the Transfer Decider
+  ;; ═══════════════════════════════════════════════════
+  ;;
+  ;; The transfer decider is also a plain map:
+
+  transfer/decider
+  ;; => {:initial-state {:status :not-found}
+  ;;     :decide        #function[...]
+  ;;     :evolve        #function[...]}
+
+  ;; Evolve through a full transfer lifecycle — pure data:
+  (decider/evolve-state transfer/decider
+                        [{:event-type "transfer-initiated" :event-version 1
+                          :payload {:from-account "a" :to-account "b" :amount 50}}
+                         {:event-type "debit-recorded" :event-version 1
+                          :payload {:account-id "a" :amount 50}}
+                         {:event-type "credit-recorded" :event-version 1
+                          :payload {:account-id "b" :amount 50}}
+                         {:event-type "transfer-completed" :event-version 1
+                          :payload {}}])
+  ;; => {:status :completed, :from-account "a", :to-account "b", :amount 50}
+
+  ;; Business rule: can't transfer to the same account:
+  (try
+    (transfer/decide {:command-type :initiate-transfer
+                      :data {:from-account "a" :to-account "a" :amount 10}}
+                     {:status :not-found})
+    (catch clojure.lang.ExceptionInfo e
+      (ex-data e)))
+  ;; => {:error/type :domain/same-account-transfer, :account "a"}
   )

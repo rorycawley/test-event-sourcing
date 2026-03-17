@@ -22,6 +22,7 @@
     ;; global_sequence-based assertions.
     (jdbc/execute-one! tx
                        ["TRUNCATE TABLE account_balances,
+                                        transfer_status,
                                         projection_checkpoints,
                                         events,
                                         idempotency_keys

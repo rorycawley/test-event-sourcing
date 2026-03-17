@@ -2,7 +2,7 @@
 
 A reference implementation of event sourcing using the **Decider pattern** (Chassaing) and **Pull-Transform-Push** (Tellman), backed by PostgreSQL.
 
-Implements a bank account domain to demonstrate: append-only event storage, optimistic concurrency with retry, command idempotency, event versioning with upcasting, and projections (derived read models).
+Implements a bank account domain to demonstrate: append-only event storage, optimistic concurrency with retry, command idempotency, event versioning with upcasting, projections (derived read models), and cross-aggregate saga coordination (fund transfers).
 
 ## Architecture
 
@@ -93,6 +93,28 @@ money-deposited v3: {amount, origin, currency}
 
 Old events stored as v1 are transparently upcasted to v3 on read. New events are always written at the latest version.
 
+### Fund Transfer Saga
+
+The transfer saga (`transfer_saga.clj`) demonstrates cross-aggregate coordination:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Transfer Saga                              │
+│                                                              │
+│  1. Initiate    → transfer stream: transfer-initiated        │
+│  2. Debit       → source account: money-withdrawn            │
+│                 → transfer stream: debit-recorded             │
+│  3. Credit      → dest account: money-deposited              │
+│                 → transfer stream: credit-recorded            │
+│  4. Complete    → transfer stream: transfer-completed         │
+│                                                              │
+│  On debit failure:   mark transfer failed (nothing to undo)  │
+│  On credit failure:  refund source, then mark failed         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The transfer is its own Decider (`transfer.clj`) with a state machine: `not-found → initiated → debited → credited → completed` (or `→ failed` from any non-terminal state). The saga coordinator uses idempotency keys derived from the transfer-id, so every step is safe to retry.
+
 ### Projections
 
 The read model (`projection.clj`) is a derived, disposable view built from the event stream:
@@ -106,22 +128,27 @@ The read model (`projection.clj`) is a derived, disposable view built from the e
 
 ```
 src/event_sourcing/
-├── account.clj               # Domain model (the Decider) -- pure, no I/O
+├── account.clj               # Account domain model (the Decider) -- pure, no I/O
+├── transfer.clj              # Transfer domain model (the Decider) -- pure, no I/O
+├── transfer_saga.clj         # Saga coordinator for cross-account transfers
 ├── decider.clj               # Command handler (Pull -> Transform -> Push)
 ├── store.clj                 # Append-only event store (PostgreSQL)
 ├── projection.clj            # Read model catch-up and rebuild
 ├── projection_dispatch.clj   # Multimethod dispatch for projection handlers
 ├── account_projection.clj    # Account event handlers for the projection
+├── transfer_projection.clj   # Transfer event handlers for the projection
 ├── schema.clj                # Shared Malli schemas
 ├── migrations.clj            # Migratus migration wrapper
 ├── migrations_cli.clj        # CLI for running migrations against external DB
 └── infra.clj                 # Testcontainer lifecycle (disposable Postgres)
 
 dev/
-└── user.clj                  # Interactive REPL walkthrough (9 steps)
+└── user.clj                  # Interactive REPL walkthrough (10 steps)
 
 test/event_sourcing/
-├── account_test.clj          # Pure domain unit tests (no DB)
+├── account_test.clj          # Pure account domain unit tests (no DB)
+├── transfer_test.clj         # Pure transfer domain unit tests (no DB)
+├── transfer_saga_test.clj    # Transfer saga integration tests (DB)
 ├── decider_test.clj          # Command handler tests (mocked store)
 ├── store_test.clj            # Store utility unit tests
 ├── store_integration_test.clj # Event store integration tests (DB)
@@ -141,7 +168,7 @@ resources/migrations/          # SQL migrations (Migratus)
 
 ## Database Schema
 
-Four tables, created via Migratus migrations:
+Five tables, created via Migratus migrations:
 
 ```sql
 -- Append-only event log
@@ -159,6 +186,12 @@ idempotency_keys (idempotency_key TEXT PK,
 -- Projection read model
 account_balances (account_id TEXT PK, balance BIGINT,
                   last_global_sequence BIGINT, updated_at TIMESTAMPTZ)
+
+-- Transfer saga read model
+transfer_status (transfer_id TEXT PK, from_account TEXT,
+                 to_account TEXT, amount BIGINT,
+                 status TEXT, failure_reason TEXT,
+                 last_global_sequence BIGINT, updated_at TIMESTAMPTZ)
 
 -- Projection progress tracking
 projection_checkpoints (projection_name TEXT PK,
@@ -243,9 +276,9 @@ bb migration-status
 
 | Layer | Files | What it tests | DB required |
 |---|---|---|---|
-| Unit | `account_test`, `decider_test`, `store_test` | Pure domain logic, command handler wiring, store utilities | No |
+| Unit | `account_test`, `transfer_test`, `decider_test`, `store_test` | Pure domain logic, command handler wiring, store utilities | No |
 | Functional | `functional_test` | End-to-end lifecycle (open -> deposit -> withdraw -> projection) | Yes |
-| Integration | `integration_test`, `store_integration_test` | Concurrency, idempotency, migrations, projection correctness | Yes |
+| Integration | `integration_test`, `store_integration_test`, `transfer_saga_test` | Concurrency, idempotency, migrations, projection correctness, cross-account sagas | Yes |
 | Property-based | `fuzz_unit_test`, `fuzz_integration_test` | Random command sequences never violate invariants; projection rebuild matches incremental | Mixed |
 | Performance | `perf`, `perf_check` | Latency and throughput benchmarks with regression detection | Yes |
 

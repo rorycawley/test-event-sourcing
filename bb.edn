@@ -6,7 +6,7 @@
   smoke
   {:doc "Require all project namespaces (quick compile/sanity check)"
    :task (shell "clj" "-M" "-e"
-                "(require 'event-sourcing.account 'event-sourcing.decider 'event-sourcing.store 'event-sourcing.projection 'event-sourcing.infra 'user)")}
+                "(require 'event-sourcing.account 'event-sourcing.decider 'event-sourcing.store 'event-sourcing.projection 'event-sourcing.transfer 'event-sourcing.transfer-saga 'event-sourcing.infra 'user)")}
 
   lint
   {:doc "Run clj-kondo on source, dev, and test namespaces"
@@ -23,7 +23,7 @@
   test
   {:doc "Run unit + functional + integration tests (DB-backed tests require Docker/Testcontainers)"
    :task (shell "clj" "-M:test" "-e"
-                "(require '[clojure.test :refer [run-tests]] 'event-sourcing.integration-test 'event-sourcing.store-integration-test 'event-sourcing.functional-test 'event-sourcing.account-test 'event-sourcing.decider-test 'event-sourcing.store-test 'event-sourcing.fuzz-unit-test 'event-sourcing.fuzz-integration-test 'event-sourcing.perf-check-test 'event-sourcing.perf-baseline-test 'event-sourcing.migrations-test 'event-sourcing.migrations-cli-test) (let [r (run-tests 'event-sourcing.integration-test 'event-sourcing.store-integration-test 'event-sourcing.functional-test 'event-sourcing.account-test 'event-sourcing.decider-test 'event-sourcing.store-test 'event-sourcing.fuzz-unit-test 'event-sourcing.fuzz-integration-test 'event-sourcing.perf-check-test 'event-sourcing.perf-baseline-test 'event-sourcing.migrations-test 'event-sourcing.migrations-cli-test)] (System/exit (if (and (zero? (:fail r)) (zero? (:error r))) 0 1)))")}
+                "(require '[clojure.test :refer [run-tests]] 'event-sourcing.integration-test 'event-sourcing.store-integration-test 'event-sourcing.functional-test 'event-sourcing.account-test 'event-sourcing.decider-test 'event-sourcing.store-test 'event-sourcing.transfer-test 'event-sourcing.transfer-saga-test 'event-sourcing.fuzz-unit-test 'event-sourcing.fuzz-integration-test 'event-sourcing.perf-check-test 'event-sourcing.perf-baseline-test 'event-sourcing.migrations-test 'event-sourcing.migrations-cli-test) (let [r (run-tests 'event-sourcing.integration-test 'event-sourcing.store-integration-test 'event-sourcing.functional-test 'event-sourcing.account-test 'event-sourcing.decider-test 'event-sourcing.store-test 'event-sourcing.transfer-test 'event-sourcing.transfer-saga-test 'event-sourcing.fuzz-unit-test 'event-sourcing.fuzz-integration-test 'event-sourcing.perf-check-test 'event-sourcing.perf-baseline-test 'event-sourcing.migrations-test 'event-sourcing.migrations-cli-test)] (System/exit (if (and (zero? (:fail r)) (zero? (:error r))) 0 1)))")}
 
   fuzz
   {:doc "Run fuzz/property tests only"
