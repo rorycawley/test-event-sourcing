@@ -10,17 +10,12 @@
    account streams (coordinated by transfer-saga.clj).
 
    Everything here is pure: no I/O, no database, no side effects."
-  (:require [event-sourcing.schema :as schema]
-            [malli.core :as m]))
+  (:require [event-sourcing.decider-kit :as kit]
+            [event-sourcing.schema :as schema]))
 
 ;; ═══════════════════════════════════════════════════
 ;; Command schemas
 ;; ═══════════════════════════════════════════════════
-
-(def ^:private command-schema
-  [:map
-   [:command-type keyword?]
-   [:data map?]])
 
 (def ^:private initiate-data-schema
   [:map
@@ -51,25 +46,6 @@
    :record-credit      record-credit-data-schema
    :complete-transfer  complete-data-schema
    :fail-transfer      fail-data-schema})
-
-(defn- invalid-command!
-  [command reason explain]
-  (throw (ex-info "Invalid command"
-                  {:error/type :domain/invalid-command
-                   :reason     reason
-                   :command    command
-                   :explain    explain})))
-
-(defn- validate-command!
-  [{:keys [command-type data] :as command}]
-  (when-not (m/validate command-schema command)
-    (invalid-command! command :invalid-shape (m/explain command-schema command)))
-  (let [data-spec (or (get command-data-specs command-type)
-                      (throw (ex-info "Unknown command"
-                                      {:error/type   :domain/unknown-command
-                                       :command-type command-type})))]
-    (when-not (m/validate data-spec data)
-      (invalid-command! command :invalid-data (m/explain data-spec data)))))
 
 ;; ═══════════════════════════════════════════════════
 ;; Event schemas (all v1)
@@ -121,46 +97,21 @@
     [:payload [:map
                [:reason schema/non-empty-string]]]]})
 
-(defn- invalid-event!
-  [event reason explain]
-  (throw (ex-info "Invalid event"
-                  {:error/type :domain/invalid-event
-                   :reason     reason
-                   :event      event
-                   :explain    explain})))
+;; ═══════════════════════════════════════════════════
+;; Kit-derived functions
+;; ═══════════════════════════════════════════════════
 
-(defn upcast-event
+(def ^:private validate-command! (kit/make-command-validator command-data-specs))
+
+(def upcast-event
   "Normalises a possibly-legacy event to the latest known schema version."
-  [event]
-  (let [event (update event :event-version #(or % 1))
-        event-type (:event-type event)
-        version (:event-version event)
-        latest-version (get latest-event-version event-type)]
-    (when-not latest-version
-      (invalid-event! event :unknown-event-type nil))
-    (when-not (pos-int? version)
-      (invalid-event! event :invalid-version nil))
-    (when (> version latest-version)
-      (invalid-event! event :unsupported-future-version nil))
-    ;; All transfer events are v1, no upcasting needed yet
-    event))
+  (kit/make-event-upcaster latest-event-version {}))
 
-(defn validate-event!
+(def validate-event!
   "Upcasts + validates one transfer domain event map."
-  [event]
-  (let [event (upcast-event event)
-        schema (get event-schemas [(:event-type event) (:event-version event)])]
-    (when-not schema
-      (invalid-event! event :missing-schema nil))
-    (when-not (m/validate schema event)
-      (invalid-event! event :invalid-shape (m/explain schema event)))
-    event))
+  (kit/make-event-validator event-schemas upcast-event))
 
-(defn- mk-event
-  [event-type payload]
-  (validate-event! {:event-type    event-type
-                    :event-version (get latest-event-version event-type)
-                    :payload       payload}))
+(def ^:private mk-event (kit/make-event-factory latest-event-version validate-event!))
 
 ;; ═══════════════════════════════════════════════════
 ;; Evolve — State → Event → State
@@ -264,15 +215,9 @@
    :complete-transfer  decide-complete
    :fail-transfer      decide-fail})
 
-(defn decide
+(def decide
   "Command → State → Event list."
-  [{:keys [command-type data] :as command} state]
-  (validate-command! command)
-  (let [decision (or (get decisions command-type)
-                     (throw (ex-info "Unknown command"
-                                     {:error/type   :domain/unknown-command
-                                      :command-type command-type})))]
-    (mapv validate-event! (decision state data))))
+  (kit/make-decide validate-command! validate-event! decisions))
 
 ;; ═══════════════════════════════════════════════════
 ;; The Decider
