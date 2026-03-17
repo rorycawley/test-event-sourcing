@@ -1,5 +1,6 @@
 (ns es.migrations-cli-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.string]
+            [clojure.test :refer [deftest is]]
             [es.migrations]
             [es.migrations-cli :as migrations-cli]
             [next.jdbc]))
@@ -103,3 +104,25 @@
                                                 :exited)]
       (is (= :exited (migrations-cli/-main "wat")))
       (is (= 1 @exit-code)))))
+
+(deftest status-command-calls-completed-and-pending
+  (let [calls (atom [])]
+    (with-redefs [es.migrations-cli/datasource-from-env! (fn [] :ds)
+                  es.migrations/completed (fn [ds]
+                                            (swap! calls conj [:completed ds])
+                                            [1])
+                  es.migrations/pending (fn [ds]
+                                          (swap! calls conj [:pending ds])
+                                          [2])]
+      (let [_ (with-out-str (migrations-cli/-main "status"))]
+        (is (seq @calls))
+        (is (some #(= :completed (first %)) @calls))
+        (is (some #(= :pending (first %)) @calls))))))
+
+(deftest status-output-includes-migration-counts
+  (with-redefs [es.migrations-cli/datasource-from-env! (fn [] :ds)
+                es.migrations/completed (fn [_] [100 200])
+                es.migrations/pending (fn [_] [300])]
+    (let [output (with-out-str (migrations-cli/-main "status"))]
+      (is (clojure.string/includes? output "Completed"))
+      (is (clojure.string/includes? output "Pending")))))

@@ -28,3 +28,19 @@
         pg       (store/->pgobject original)
         decoded  (store/<-pgobject pg)]
     (is (= original decoded))))
+
+(deftest pgobject-nil-returns-nil
+  (is (nil? (store/<-pgobject nil))))
+
+(deftest timestamp-nil-returns-nil
+  (is (nil? (store/<-timestamp nil))))
+
+(deftest timestamp-converts-to-instant
+  (let [ts (java.sql.Timestamp. 1000)]
+    (is (instance? java.time.Instant (store/<-timestamp ts)))))
+
+(deftest uuid-v7-monotonic-timestamp-bits
+  (let [ids (repeatedly 10 #(do (Thread/sleep 1) (store/uuid-v7)))
+        msbs (mapv #(.getMostSignificantBits %) ids)]
+    (is (= msbs (sort msbs))
+        "UUIDv7 MSBs should be monotonically increasing across distinct milliseconds")))
