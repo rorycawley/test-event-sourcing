@@ -25,7 +25,8 @@
                                         transfer_status,
                                         projection_checkpoints,
                                         events,
-                                        idempotency_keys
+                                        idempotency_keys,
+                                        event_outbox
                          RESTART IDENTITY"])))
 
 (defn with-clean-db [f]

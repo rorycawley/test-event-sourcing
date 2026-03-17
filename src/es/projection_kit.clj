@@ -18,18 +18,23 @@
 (defn make-handler
   "Returns a handler function (fn [tx event context]) that dispatches
    on :event-type. handler-specs is a map of {event-type -> handler-fn}.
-   Throws on unknown event types."
-  [handler-specs]
+
+   opts:
+     :skip-unknown? — if true, silently skip unknown event types instead
+                      of throwing. Use this for independent async projectors
+                      that only handle a subset of all event types."
+  [handler-specs & {:keys [skip-unknown?] :or {skip-unknown? false}}]
   (fn [tx {:keys [event-type] :as event} context]
     (let [handler (get handler-specs event-type)]
-      (when-not handler
-        (throw (ex-info "Unknown event type for projection"
-                        {:projection-name (:projection-name context)
-                         :event-type      event-type
-                         :event-version   (:event-version event)
-                         :global-sequence (:global-sequence event)
-                         :stream-id       (:stream-id event)})))
-      (handler tx event context))))
+      (if handler
+        (handler tx event context)
+        (when-not skip-unknown?
+          (throw (ex-info "Unknown event type for projection"
+                          {:projection-name (:projection-name context)
+                           :event-type      event-type
+                           :event-version   (:event-version event)
+                           :global-sequence (:global-sequence event)
+                           :stream-id       (:stream-id event)})))))))
 
 (defn make-query
   "Returns a query function (fn [ds id] row-or-nil) for a read model table."

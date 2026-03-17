@@ -280,7 +280,8 @@
    • The advisory lock serialises all writers for a given stream-id
      within Postgres, so the version-check + insert is atomic.
    • UNIQUE(stream_id, stream_sequence) remains the safety-net."
-  [ds stream-id expected-version idempotency-key command events]
+  [ds stream-id expected-version idempotency-key command events
+   & {:keys [on-events-appended]}]
   (when-not (map? command)
     (throw (ex-info "append-events! requires command metadata map"
                     {:stream-id       stream-id
@@ -328,5 +329,18 @@
                                   (:event-type event)
                                   (:event-version event)
                                   (->pgobject (:payload event))]))
+
+              ;; 5. Optional post-append hook (e.g. outbox writes).
+              ;;    Called within the same transaction.
+            (when on-events-appended
+              (let [sequences
+                    (mapv :global-sequence
+                          (jdbc/execute! tx
+                                         ["SELECT global_sequence FROM events
+                            WHERE stream_id = ? AND stream_sequence > ?
+                            ORDER BY stream_sequence ASC"
+                                          stream-id expected-version]
+                                         {:builder-fn rs/as-unqualified-kebab-maps}))]
+                (on-events-appended tx sequences)))
 
             :ok))))))

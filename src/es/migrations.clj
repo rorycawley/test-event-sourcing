@@ -11,25 +11,30 @@
    :migration-table-name "schema_migrations"})
 
 (defn- migratus-config
-  [ds]
-  (assoc base-config :db {:datasource ds}))
+  [ds & {:keys [migration-dir]}]
+  (cond-> (assoc base-config :db {:datasource ds})
+    migration-dir (assoc :migration-dir migration-dir)))
 
 (defn migrate!
-  "Applies all pending migrations."
-  [ds]
-  (migratus/migrate (migratus-config ds)))
+  "Applies all pending migrations.
+   Optional :migration-dir overrides the default \"migrations\" directory."
+  [ds & {:keys [migration-dir]}]
+  (migratus/migrate (migratus-config ds :migration-dir migration-dir)))
 
 (defn rollback!
-  "Rolls back the most recently applied migration."
-  [ds]
-  (migratus/rollback (migratus-config ds)))
+  "Rolls back the most recently applied migration.
+   Optional :migration-dir overrides the default \"migrations\" directory."
+  [ds & {:keys [migration-dir]}]
+  (migratus/rollback (migratus-config ds :migration-dir migration-dir)))
 
 (defn pending
-  "Returns pending migrations."
-  [ds]
-  (migratus/pending-list (migratus-config ds)))
+  "Returns pending migrations.
+   Optional :migration-dir overrides the default \"migrations\" directory."
+  [ds & {:keys [migration-dir]}]
+  (migratus/pending-list (migratus-config ds :migration-dir migration-dir)))
 
 (defn completed
-  "Returns completed migrations."
-  [ds]
-  (migratus/completed-list (migratus-config ds)))
+  "Returns completed migrations.
+   Optional :migration-dir overrides the default \"migrations\" directory."
+  [ds & {:keys [migration-dir]}]
+  (migratus/completed-list (migratus-config ds :migration-dir migration-dir)))

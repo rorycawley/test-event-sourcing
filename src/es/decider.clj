@@ -83,7 +83,8 @@
    Returns :ok or :idempotent.
    Throws on business-rule violation, idempotency collision,
    or concurrency conflict."
-  [ds decider {:keys [stream-id idempotency-key] :as command}]
+  [ds decider {:keys [stream-id idempotency-key] :as command}
+   & {:keys [on-events-appended]}]
   (validate-command-envelope! command)
   ;; Fast path: if this command key has already been claimed for the
   ;; same command, return :idempotent before any domain checks.
@@ -112,7 +113,8 @@
       ;; Optimistic concurrency and idempotency are enforced
       ;; by the store inside a single transaction.
       (store/append-events! ds stream-id version
-                            idempotency-key command new-events))))
+                            idempotency-key command new-events
+                            :on-events-appended on-events-appended))))
 
 (defn handle-with-retry!
   "Like handle!, but retries on optimistic concurrency conflicts.
@@ -127,7 +129,8 @@
                                 base-backoff-ms
                                 max-backoff-ms
                                 jitter-ms
-                                sleep-fn]
+                                sleep-fn
+                                on-events-appended]
                          :or {max-retries     3
                               base-backoff-ms 5
                               max-backoff-ms  200
@@ -143,7 +146,8 @@
               (+ capped jitter)))]
     (loop [attempt 1]
       (let [result (try
-                     (handle! ds decider command)
+                     (handle! ds decider command
+                              :on-events-appended on-events-appended)
                      (catch clojure.lang.ExceptionInfo e
                        (if (and (store/optimistic-concurrency-conflict? e)
                                 (< attempt max-retries))

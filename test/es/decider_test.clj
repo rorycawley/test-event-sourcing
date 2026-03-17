@@ -5,7 +5,7 @@
 (deftest retries-on-structured-optimistic-conflict
   (let [attempts (atom 0)]
     (with-redefs [es.decider/handle!
-                  (fn [_ _ _]
+                  (fn [_ _ _ & _]
                     (if (< (swap! attempts inc) 3)
                       (throw (ex-info "message intentionally unrelated"
                                       {:error/type       :concurrency/optimistic-conflict
@@ -18,7 +18,7 @@
   (let [attempts (atom 0)
         e (try
             (with-redefs [es.decider/handle!
-                          (fn [_ _ _]
+                          (fn [_ _ _ & _]
                             (swap! attempts inc)
                             (throw (ex-info "optimistic conflict but no retry flag"
                                             {:error/type :concurrency/optimistic-conflict})))]
@@ -33,7 +33,7 @@
   (let [attempts (atom 0)
         e (try
             (with-redefs [es.decider/handle!
-                          (fn [_ _ _]
+                          (fn [_ _ _ & _]
                             (swap! attempts inc)
                             (throw (ex-info "always conflict"
                                             {:error/type       :concurrency/optimistic-conflict
@@ -49,7 +49,7 @@
   (let [attempts (atom 0)
         sleeps   (atom [])]
     (with-redefs [es.decider/handle!
-                  (fn [_ _ _]
+                  (fn [_ _ _ & _]
                     (if (< (swap! attempts inc) 3)
                       (throw (ex-info "conflict"
                                       {:error/type       :concurrency/optimistic-conflict

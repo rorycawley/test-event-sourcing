@@ -386,3 +386,88 @@
       (ex-data e)))
   ;; => {:error/type :domain/same-account-transfer, :account "a"}
   )
+
+;; ═══════════════════════════════════════════════════
+;; Full Async System (Component)
+;; ═══════════════════════════════════════════════════
+;;
+;; The full system includes:
+;;   - Event store (Postgres)        — write side
+;;   - Read store (separate Postgres) — read side
+;;   - RabbitMQ                       — event broker
+;;   - Outbox poller                  — reliable publishing
+;;   - Async projectors               — account + transfer
+;;
+;; RabbitMQ messages are "wake up" notifications.
+;; Each projector reads from the event store using checkpoints.
+;; Missed messages are recovered by periodic catch-up.
+
+(comment
+
+  (require '[com.stuartsierra.component :as component]
+           '[bank.components :as bank-components]
+           '[es.outbox :as outbox])
+
+  ;; ── Start the full system ──────────────────────
+
+  (def system (component/start (bank-components/dev-full-system)))
+  ;; Starts 3 Testcontainers (2× Postgres, 1× RabbitMQ),
+  ;; runs migrations, starts outbox poller + projectors.
+
+  ;; ── Grab datasources ──────────────────────────
+
+  (def event-ds (get-in system [:event-store-ds :datasource]))
+  (def read-ds  (get-in system [:read-db-ds :datasource]))
+
+  ;; ── Send commands (events flow async to read DB) ──
+
+  (def outbox-hook (outbox/make-outbox-hook))
+
+  (decider/handle-with-retry! event-ds account/decider
+                              {:command-type    :open-account
+                               :stream-id       "account-1"
+                               :idempotency-key "open-1"
+                               :data            {:owner "Alice"}}
+                              :on-events-appended outbox-hook)
+
+  (decider/handle-with-retry! event-ds account/decider
+                              {:command-type    :deposit
+                               :stream-id       "account-1"
+                               :idempotency-key "dep-100"
+                               :data            {:amount 100}}
+                              :on-events-appended outbox-hook)
+
+  ;; Wait a moment, then query the read DB:
+  (account-projection/get-balance read-ds "account-1")
+  ;; => {:account-id "account-1", :balance 100, ...}
+
+  ;; ── Transfer (saga) ────────────────────────────
+
+  (decider/handle-with-retry! event-ds account/decider
+                              {:command-type    :open-account
+                               :stream-id       "account-2"
+                               :idempotency-key "open-2"
+                               :data            {:owner "Bob"}}
+                              :on-events-appended outbox-hook)
+
+  (decider/handle-with-retry! event-ds account/decider
+                              {:command-type    :deposit
+                               :stream-id       "account-2"
+                               :idempotency-key "dep-2-200"
+                               :data            {:amount 200}}
+                              :on-events-appended outbox-hook)
+
+  (saga/execute! event-ds "tx-001" "account-1" "account-2" 30)
+  ;; Saga events are picked up by catch-up timer (no outbox hook).
+
+  ;; After a few seconds:
+  (account-projection/get-balance read-ds "account-1")
+  ;; => {:balance 70, ...}
+  (account-projection/get-balance read-ds "account-2")
+  ;; => {:balance 230, ...}
+  (transfer-projection/get-transfer read-ds "transfer-tx-001")
+  ;; => {:status "completed", ...}
+
+  ;; ── Stop the system ────────────────────────────
+
+  (component/stop system))

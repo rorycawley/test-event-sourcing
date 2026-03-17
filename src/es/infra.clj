@@ -1,11 +1,11 @@
 (ns es.infra
   "Testcontainer lifecycle and datasource construction.
 
-   Start a disposable Postgres for REPL-driven development.
+   Start disposable Postgres and RabbitMQ containers for development.
    Every value is plain data or a closeable resource —
    no hidden state, no singletons."
   (:require [next.jdbc :as jdbc])
-  (:import [org.testcontainers.containers PostgreSQLContainer]))
+  (:import [org.testcontainers.containers PostgreSQLContainer RabbitMQContainer]))
 
 ;; ——— Container lifecycle ———
 
@@ -34,3 +34,23 @@
   (jdbc/get-datasource {:jdbcUrl  jdbc-url
                         :user     username
                         :password password}))
+
+;; ——— RabbitMQ container lifecycle ———
+
+(defn start-rabbitmq!
+  "Starts a RabbitMQ container. Returns a map of connection details
+   plus the container reference (for stopping later)."
+  []
+  (let [container (doto (RabbitMQContainer. "rabbitmq:3-management-alpine")
+                    (.start))]
+    {:container container
+     :host      (.getHost container)
+     :port      (.getAmqpPort container)
+     :username  "guest"
+     :password  "guest"}))
+
+(defn stop-rabbitmq!
+  "Stops a previously started RabbitMQ container."
+  [{:keys [container]}]
+  (when container
+    (.stop container)))
