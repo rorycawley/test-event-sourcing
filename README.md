@@ -230,15 +230,16 @@ Then evaluate the commented forms in `user.clj` step by step. The walkthrough co
 6. Demonstrating optimistic concurrency conflicts
 7. Demonstrating idempotency
 8. Demonstrating retry-on-conflict
-9. Tearing down
+9. Fund transfer saga (cross-account transfers, compensation, crash recovery)
+10. Tearing down
 
 ### Running Tests
 
 ```bash
-# All tests (unit + functional + integration + fuzz)
+# All tests — auto-discovers *_test namespaces (no manual enumeration)
 bb test
 
-# Fuzz/property-based tests only
+# Fuzz/property-based tests only (filters by namespace pattern)
 bb fuzz
 
 # Quick checks (lint + format + compile)
@@ -298,6 +299,7 @@ All DB-backed tests use Testcontainers (PostgreSQL 16 Alpine) -- no external dat
 | Migratus 1.6.4 | Database migrations |
 | data.json 2.4.0 | JSON serialisation |
 | test.check 1.1.1 | Property-based testing |
+| Cognitect test-runner 0.5.1 | Test autodiscovery |
 | cloverage 1.2.4 | Code coverage |
 
 ## Key Design Decisions
