@@ -6,6 +6,7 @@
             [event-sourcing.account :as account]
             [event-sourcing.decider :as decider]
             [event-sourcing.infra :as infra]
+            [event-sourcing.migrations :as migrations]
             [event-sourcing.projection :as projection]
             [event-sourcing.store :as store]
             [next.jdbc :as jdbc])
@@ -276,7 +277,7 @@
         pg     (infra/start-postgres!)
         ds     (infra/->datasource pg)]
     (try
-      (store/create-schema! ds)
+      (migrations/migrate! ds)
       {:meta
        {:generated-at (str (Instant/now))
         :git-sha      (git-sha)

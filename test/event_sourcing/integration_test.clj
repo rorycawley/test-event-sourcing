@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [event-sourcing.account :as account]
             [event-sourcing.decider :as decider]
+            [event-sourcing.migrations :as migrations]
             [event-sourcing.projection :as projection]
             [event-sourcing.store :as store]
             [event-sourcing.test-support :as support]
@@ -46,13 +47,13 @@
     (is (some? e))
     (is (= "append-events! requires command metadata map" (.getMessage e)))))
 
-(deftest schema-migrations-are-applied-and-create-schema-is-idempotent
+(deftest schema-migrations-are-applied-and-migrate-is-idempotent
   (let [ids-before (mapv :id
                          (jdbc/execute! support/*ds*
                                         ["SELECT id FROM schema_migrations ORDER BY id"]
                                         {:builder-fn rs/as-unqualified-kebab-maps}))]
     (is (every? (set ids-before) [20260316233000 20260316233100]))
-    (is (nil? (store/create-schema! support/*ds*)))
+    (is (nil? (migrations/migrate! support/*ds*)))
     (let [ids-after (mapv :id
                           (jdbc/execute! support/*ds*
                                          ["SELECT id FROM schema_migrations ORDER BY id"]

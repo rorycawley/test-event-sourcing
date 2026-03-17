@@ -1,18 +1,20 @@
 (ns event-sourcing.account
-  "Bank-account domain — the account Decider.
+  "Bank-account domain — the account Decider (Chassaing).
 
-   A Decider is a plain map with three elements:
+   Commands (intent):  :open-account, :deposit, :withdraw
+   Events (facts):     account-opened, money-deposited, money-withdrawn
+   State (truth):      {:status :not-found|:open, :balance N, :owner S}
+
+   The Decider is a plain map:
 
      :initial-state — the state before any events have occurred
-     :decide        — Command → State → Event list (business rules)
-     :evolve        — State → Event → State (state transitions)
+     :decide        — Command → State → [Event]  (business rules)
+     :evolve        — State → Event → State       (state transitions)
 
    Everything here is pure: no I/O, no database, no side effects.
-   Uses malli for command + event boundary validation, including
-   versioned event schemas.
-
-   Tellman: data > functions > macros.
-  Chassaing: the Decider pattern."
+   The same decide and evolve functions work in tests with hand-crafted
+   data, in a REPL, or against PostgreSQL — the domain never changes
+   when infrastructure changes."
   (:require [event-sourcing.decider-kit :as kit]
             [event-sourcing.schema :as schema]))
 

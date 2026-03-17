@@ -1,6 +1,6 @@
 (ns event-sourcing.test-support
   (:require [event-sourcing.infra :as infra]
-            [event-sourcing.store :as store]
+            [event-sourcing.migrations :as migrations]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]))
 
@@ -10,7 +10,7 @@
   (let [pg (infra/start-postgres!)
         ds (infra/->datasource pg)]
     (try
-      (store/create-schema! ds)
+      (migrations/migrate! ds)
       (binding [*ds* ds]
         (f))
       (finally
@@ -37,7 +37,7 @@
                              ["SELECT last_global_sequence
                                FROM projection_checkpoints
                               WHERE projection_name = ?"
-                              "account_balances"]
+                              "main"]
                              {:builder-fn rs/as-unqualified-kebab-maps})
           :last-global-sequence)
       0))

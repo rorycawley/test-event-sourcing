@@ -39,5 +39,5 @@ JDBC_URL=jdbc:postgresql://localhost:5432/test_event_sourcing bb rollback
 
 ## Notes
 
-- `store/create-schema!` is a migration entrypoint and applies pending Migratus migrations.
+- `migrations/migrate!` applies pending Migratus migrations.
 - Tests run against fresh containers and call the same migration path.

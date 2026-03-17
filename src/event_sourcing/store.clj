@@ -38,7 +38,6 @@
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [clojure.data.json :as json]
-            [event-sourcing.migrations :as migrations]
             [event-sourcing.schema :as schema]
             [malli.core :as m])
   (:import [org.postgresql.util PGobject]
@@ -90,11 +89,17 @@
   (when ts
     (.toInstant ts)))
 
-(defn create-schema!
-  "Applies pending schema migrations via Migratus.
-   All schema evolution should be done through resources/migrations."
-  [ds]
-  (migrations/migrate! ds))
+;; ——— Advisory locking ———
+
+(defn advisory-lock!
+  "Acquires a transaction-scoped advisory lock keyed by the given name.
+   Derives a 64-bit lock key from md5 to minimise accidental collisions."
+  [tx lock-name]
+  (jdbc/execute-one! tx
+                     ["SELECT pg_advisory_xact_lock(
+                            ('x' || substr(md5(?), 1, 16))::bit(64)::bigint
+                          )"
+                      lock-name]))
 
 ;; ——— Reading ———
 
@@ -288,14 +293,7 @@
         :idempotent
         (let [events (normalize-events events)]
             ;; 2. Acquire a transaction-scoped advisory lock for this stream.
-            ;;    We derive a 64-bit lock key from md5("stream:" || stream-id).
-            ;;    This materially lowers accidental lock-key collisions versus
-            ;;    hashtext(stream-id), which is only 32-bit.
-          (jdbc/execute-one! tx
-                             ["SELECT pg_advisory_xact_lock(
-                                    ('x' || substr(md5(?), 1, 16))::bit(64)::bigint
-                                  )"
-                              (str "stream:" stream-id)])
+          (advisory-lock! tx (str "stream:" stream-id))
 
             ;; 3. Optimistic concurrency — stale read detection.
           (let [actual-version

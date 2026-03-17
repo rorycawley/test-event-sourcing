@@ -37,6 +37,7 @@
 ;; projection — read model
 
 (require '[event-sourcing.infra          :as infra]
+         '[event-sourcing.migrations     :as migrations]
          '[event-sourcing.store          :as store]
          '[event-sourcing.decider        :as decider]
          '[event-sourcing.account        :as account]
@@ -62,7 +63,7 @@
   ;; Step 2 — Create the schema
   ;; ═══════════════════════════════════════════════════
 
-  (store/create-schema! ds)
+  (migrations/migrate! ds)
 
   ;; ═══════════════════════════════════════════════════
   ;; Step 3 — Send commands

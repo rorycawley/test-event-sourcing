@@ -1,29 +1,32 @@
 (ns event-sourcing.transfer-saga
-  "Saga coordinator for fund transfers.
+  "Saga coordinator for fund transfers — infrastructure, not domain.
 
-   Orchestrates a transfer across two account aggregates and one
-   transfer aggregate. The transfer stream is the saga's own
-   event log — it tracks which steps have completed.
+   This namespace is the I/O orchestrator that coordinates three
+   Deciders (Chassaing): two account Deciders (source and destination)
+   and one transfer Decider (saga progress tracker). The Deciders
+   themselves are pure; this namespace provides the wiring that moves
+   commands and events between them via the store.
 
-   The saga follows this protocol:
+   The saga protocol is a state machine driven by the transfer Decider:
 
-     1. Initiate  — create transfer stream with from/to/amount
-     2. Debit     — withdraw from source account
-     3. Credit    — deposit to destination account
-     4. Complete  — mark transfer done
+     :not-found → :initiated → :debited → :credited → :completed
+                       ↓            ↓
+                    :failed      :failed (with compensation)
 
-   On failure at step 2 (insufficient funds, account not open):
-     → mark transfer failed (no compensation needed — nothing moved yet)
+   Each step:
+     1. Executes an account command (debit or credit)     — I/O
+     2. Records progress on the transfer stream            — I/O
+     3. Advances to the next state                         — loop
 
-   On failure at step 3 (destination account not open):
-     → compensate: re-credit the source account
-     → mark transfer failed
+   On failure:
+     - At debit:  mark transfer failed (nothing to undo)
+     - At credit: compensate (refund source), then mark failed
 
-   The saga is **resumable**: if the process crashes mid-transfer,
-   resume! reads the transfer stream, recovers the current state,
-   and picks up from the last completed step. Every step uses
-   idempotency keys derived from the transfer-id, so re-execution
-   is always safe."
+   Crash recovery uses the same Pull → Transform pattern as the
+   command handler: load the transfer stream, evolve to current state,
+   and resume from whatever step the state machine says is next.
+   Every step uses idempotency keys derived from the transfer-id,
+   so re-execution is always safe — money is never lost or duplicated."
   (:require [event-sourcing.account :as account]
             [event-sourcing.decider :as decider]
             [event-sourcing.store :as store]
@@ -35,91 +38,142 @@
 (defn- step-key [transfer-id step]
   (str "transfer-" transfer-id "-" (name step)))
 
+;; ═══════════════════════════════════════════════════
+;; Account command helpers
+;; ═══════════════════════════════════════════════════
+
+(defn- domain-error?
+  "Returns true when an exception is a domain-level rejection
+   (business rule violation), not an infrastructure failure."
+  [e]
+  (let [error-type (:error/type (ex-data e))]
+    (and (keyword? error-type)
+         (= "domain" (namespace error-type)))))
+
 (defn- try-account-command!
   "Attempts an account command, returning :ok/:idempotent on success
-   or {:error true :reason \"...\"} on domain failure."
+   or {:error true :reason \"...\"} on domain rejection.
+   Infrastructure errors (DB down, connection lost) propagate — they
+   should not be confused with domain rejections."
   [ds command]
   (try
     (decider/handle-with-retry! ds account/decider command)
     (catch clojure.lang.ExceptionInfo e
-      {:error  true
-       :reason (or (some-> (ex-data e) :error/type name)
-                   (.getMessage e))
-       :ex     e})))
+      (if (domain-error? e)
+        {:error  true
+         :reason (name (:error/type (ex-data e)))}
+        (throw e)))))
+
+;; ═══════════════════════════════════════════════════
+;; Transfer stream helpers
+;; ═══════════════════════════════════════════════════
+
+(defn- record-transfer-command!
+  "Sends a command to the transfer Decider."
+  [ds stream transfer-id command-type step data]
+  (decider/handle! ds transfer/decider
+                   {:command-type    command-type
+                    :stream-id       stream
+                    :idempotency-key (step-key transfer-id step)
+                    :data            data}))
 
 (defn- fail-transfer!
   [ds stream transfer-id reason]
-  (decider/handle! ds transfer/decider
-                   {:command-type    :fail-transfer
-                    :stream-id       stream
-                    :idempotency-key (step-key transfer-id :fail)
-                    :data            {:reason reason}}))
+  (record-transfer-command! ds stream transfer-id
+                            :fail-transfer :fail
+                            {:reason reason}))
 
 ;; ═══════════════════════════════════════════════════
-;; Saga steps — each picks up from the named state
+;; Step execution — one function per state transition
 ;; ═══════════════════════════════════════════════════
+;;
+;; Each returns either:
+;;   {:status :completed}               — saga done
+;;   {:status :failed :reason "..."}    — saga done (domain rejection)
+;;   {:next-status :debited ...}        — advance the loop
+;;   {:next-status :credited ...}       — advance the loop
 
-(declare continue-from-initiated continue-from-debited continue-from-credited)
+(defn- execute-initiated
+  "State is :initiated — debit the source account."
+  [ds transfer-id stream {:keys [from-account amount]}]
+  (let [result (try-account-command!
+                ds
+                {:command-type    :withdraw
+                 :stream-id       from-account
+                 :idempotency-key (step-key transfer-id :debit)
+                 :data            {:amount amount}})]
+    (if (:error result)
+      (do (fail-transfer! ds stream transfer-id (:reason result))
+          {:status :failed :reason (:reason result)})
+      (do (record-transfer-command! ds stream transfer-id
+                                    :record-debit :record-debit
+                                    {:account-id from-account :amount amount})
+          {:next-status :debited}))))
 
-(defn- continue-from-initiated
-  "Saga is initiated — next: debit the source account."
+(defn- execute-debited
+  "State is :debited — credit the destination account."
   [ds transfer-id stream {:keys [from-account to-account amount]}]
-  (let [debit-result (try-account-command!
-                      ds
-                      {:command-type    :withdraw
-                       :stream-id       from-account
-                       :idempotency-key (step-key transfer-id :debit)
-                       :data            {:amount amount}})]
-    (if (:error debit-result)
-      (do (fail-transfer! ds stream transfer-id (:reason debit-result))
-          {:status :failed :reason (:reason debit-result)})
-      (do (decider/handle! ds transfer/decider
-                           {:command-type    :record-debit
-                            :stream-id       stream
-                            :idempotency-key (step-key transfer-id :record-debit)
-                            :data            {:account-id from-account
-                                              :amount     amount}})
-          (continue-from-debited ds transfer-id stream
-                                 {:from-account from-account
-                                  :to-account   to-account
-                                  :amount       amount})))))
+  (let [result (try-account-command!
+                ds
+                {:command-type    :deposit
+                 :stream-id       to-account
+                 :idempotency-key (step-key transfer-id :credit)
+                 :data            {:amount amount}})]
+    (if (:error result)
+      ;; Credit failed — compensate: refund the source.
+      ;; The refund MUST succeed; if it fails, propagate the error
+      ;; rather than silently losing money.
+      (let [refund-result (try-account-command!
+                           ds
+                           {:command-type    :deposit
+                            :stream-id       from-account
+                            :idempotency-key (step-key transfer-id :compensate)
+                            :data            {:amount amount}})]
+        (when (:error refund-result)
+          (throw (ex-info "Compensation failed: unable to refund source account"
+                          {:error/type    :saga/compensation-failed
+                           :transfer-id   transfer-id
+                           :from-account  from-account
+                           :amount        amount
+                           :credit-reason (:reason result)
+                           :refund-reason (:reason refund-result)})))
+        (fail-transfer! ds stream transfer-id (:reason result))
+        {:status :failed :reason (:reason result)})
+      (do (record-transfer-command! ds stream transfer-id
+                                    :record-credit :record-credit
+                                    {:account-id to-account :amount amount})
+          {:next-status :credited}))))
 
-(defn- continue-from-debited
-  "Source account debited — next: credit the destination account."
-  [ds transfer-id stream {:keys [from-account to-account amount]}]
-  (let [credit-result (try-account-command!
-                       ds
-                       {:command-type    :deposit
-                        :stream-id       to-account
-                        :idempotency-key (step-key transfer-id :credit)
-                        :data            {:amount amount}})]
-    (if (:error credit-result)
-      ;; Credit failed — compensate: refund the source
-      (do (try-account-command!
-           ds
-           {:command-type    :deposit
-            :stream-id       from-account
-            :idempotency-key (step-key transfer-id :compensate)
-            :data            {:amount amount}})
-          (fail-transfer! ds stream transfer-id (:reason credit-result))
-          {:status :failed :reason (:reason credit-result)})
-      (do (decider/handle! ds transfer/decider
-                           {:command-type    :record-credit
-                            :stream-id       stream
-                            :idempotency-key (step-key transfer-id :record-credit)
-                            :data            {:account-id to-account
-                                              :amount     amount}})
-          (continue-from-credited ds transfer-id stream)))))
-
-(defn- continue-from-credited
-  "Both accounts updated — next: mark transfer complete."
+(defn- execute-credited
+  "State is :credited — mark the transfer complete."
   [ds transfer-id stream]
-  (decider/handle! ds transfer/decider
-                   {:command-type    :complete-transfer
-                    :stream-id       stream
-                    :idempotency-key (step-key transfer-id :complete)
-                    :data            {}})
+  (record-transfer-command! ds stream transfer-id
+                            :complete-transfer :complete {})
   {:status :completed})
+
+;; ═══════════════════════════════════════════════════
+;; State machine loop
+;; ═══════════════════════════════════════════════════
+
+(defn- run-from
+  "Drives the saga from the given state until it reaches a terminal
+   status (:completed or :failed). The transfer Decider's state
+   machine determines what happens at each step.
+   If the state is already terminal (e.g. idempotent re-execution),
+   returns immediately."
+  [ds transfer-id stream state]
+  (loop [status (:status state)
+         state  state]
+    (case status
+      :completed {:status :completed}
+      :failed    {:status :failed :reason (:failure-reason state)}
+      (let [result (case status
+                     :initiated (execute-initiated ds transfer-id stream state)
+                     :debited   (execute-debited ds transfer-id stream state)
+                     :credited  (execute-credited ds transfer-id stream))]
+        (if (:next-status result)
+          (recur (:next-status result) state)
+          result)))))
 
 ;; ═══════════════════════════════════════════════════
 ;; Public API
@@ -130,43 +184,41 @@
 
    Parameters:
      ds          — datasource
-     transfer-id — unique identifier for this transfer (used as stream suffix)
+     transfer-id — unique identifier for this transfer
      from        — source account stream-id
      to          — destination account stream-id
      amount      — positive integer amount to transfer
 
    Returns a map:
-     {:status :completed} on success
-     {:status :failed, :reason \"...\"} on business rule failure
+     {:status :completed}                on success
+     {:status :failed, :reason \"...\"}  on domain rejection
 
    The entire saga is idempotent — re-executing with the same
    transfer-id will skip already-completed steps."
   [ds transfer-id from to amount]
   (let [stream (transfer-stream-id transfer-id)]
-    ;; Step 1: Initiate the transfer
-    (decider/handle! ds transfer/decider
-                     {:command-type    :initiate-transfer
-                      :stream-id       stream
-                      :idempotency-key (step-key transfer-id :initiate)
-                      :data            {:from-account from
-                                        :to-account   to
-                                        :amount       amount}})
-    (continue-from-initiated ds transfer-id stream
-                             {:from-account from
-                              :to-account   to
-                              :amount       amount})))
+    ;; Step 1: Record the initiation event
+    (record-transfer-command! ds stream transfer-id
+                              :initiate-transfer :initiate
+                              {:from-account from :to-account to :amount amount})
+    ;; Pull → Transform: let the Decider be the single source of truth
+    ;; for state, rather than constructing it by hand.
+    (let [state (decider/evolve-state transfer/decider
+                                      (store/load-stream ds stream))]
+      (run-from ds transfer-id stream state))))
 
 (defn resume!
   "Resumes an in-progress transfer from its last completed step.
 
-   Reads the transfer stream, evolves to current state, and picks
-   up where the saga left off. Safe to call on any transfer —
-   completed or failed transfers return their terminal status
-   immediately.
+   Uses the same Pull → Transform pattern as the command handler:
+   loads the transfer stream, evolves to current state via the
+   transfer Decider, then enters the state machine loop at whatever
+   step is next. Safe to call on any transfer — terminal states
+   return immediately.
 
    This is the crash-recovery mechanism: if the process dies
    mid-transfer, call resume! with the same transfer-id to
-   continue from the last persisted step.
+   continue. Every step is idempotent, so resumption is always safe.
 
    Returns a map:
      {:status :completed}                        — transfer finished
@@ -178,23 +230,11 @@
         events (store/load-stream ds stream)
         state  (decider/evolve-state transfer/decider events)]
     (case (:status state)
-      :not-found
-      (throw (ex-info "Transfer not found"
-                      {:error/type   :saga/transfer-not-found
-                       :transfer-id  transfer-id
-                       :stream-id    stream}))
-
-      :initiated
-      (continue-from-initiated ds transfer-id stream state)
-
-      :debited
-      (continue-from-debited ds transfer-id stream state)
-
-      :credited
-      (continue-from-credited ds transfer-id stream)
-
-      :completed
-      {:status :already-completed}
-
-      :failed
-      {:status :already-failed :reason (:failure-reason state)})))
+      :not-found  (throw (ex-info "Transfer not found"
+                                  {:error/type  :saga/transfer-not-found
+                                   :transfer-id transfer-id
+                                   :stream-id   stream}))
+      :completed  {:status :already-completed}
+      :failed     {:status :already-failed :reason (:failure-reason state)}
+      ;; Non-terminal: re-enter the state machine loop
+      (run-from ds transfer-id stream state))))

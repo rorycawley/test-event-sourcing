@@ -1,16 +1,23 @@
 (ns event-sourcing.decider-kit
-  "Data-driven toolkit for building Deciders.
+  "Data-driven toolkit for building Deciders (Chassaing).
 
-   Provide your schemas and upcasters as data; get back validated
-   command/event functions. No macros — just functions that return
-   functions.
+   A Decider needs validated commands, versioned events with upcasting,
+   and dispatch from command type to decision function. This namespace
+   provides the shared infrastructure so that domain files declare
+   *what* (schemas, upcasters, decisions) as data, not *how*.
 
-   Usage:
-     (def validate-command! (kit/make-command-validator command-data-specs))
-     (def upcast-event      (kit/make-event-upcaster latest-versions upcasters))
-     (def validate-event!   (kit/make-event-validator event-schemas upcast-event))
-     (def mk-event          (kit/make-event-factory latest-versions validate-event!))
-     (def decide            (kit/make-decide validate-command! validate-event! decisions))"
+   Five factory functions — each takes data, returns a function:
+
+     make-command-validator  command-data-specs          → (command → nil | throw)
+     make-event-upcaster    latest-versions, upcasters  → (event → event')
+     make-event-validator   event-schemas, upcast-fn    → (event → event' | throw)
+     make-event-factory     latest-versions, validate   → (type, payload → event)
+     make-decide            validate-cmd, validate-evt, → (command, state → [event])
+                            decisions
+
+   Adding a new aggregate means writing schemas, evolve, and decision
+   functions — no boilerplate to copy. No macros — just functions that
+   return functions."
   (:require [malli.core :as m]))
 
 ;; ═══════════════════════════════════════════════════

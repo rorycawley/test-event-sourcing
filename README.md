@@ -32,29 +32,40 @@ Implements a bank account domain to demonstrate: append-only event storage, opti
 │            │  (projection.clj)    │                             │
 │            │                      │                             │
 │            │  account_balances    │                             │
-│            │  (derived read model)│                             │
+│            │  transfer_status     │                             │
+│            │  (derived read models)│                            │
 │            └──────────────────────┘                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### The Decider Pattern
 
-The domain is defined as a plain Clojure map with three elements:
+The Decider pattern ([Chassaing, 2021](https://thinkbeforecoding.com/post/2021/12/17/functional-event-sourcing-decider)) separates *what should happen* from *how it is stored*. A Decider is defined by three elements:
 
-```clojure
-{:initial-state {:status :not-found, :balance 0}
- :decide        decide   ;; Command -> State -> [Event]
- :evolve        evolve}  ;; State -> Event -> State
+```
+Command  — an intent: "please do this"          (imperative: open-account, deposit, withdraw)
+Event    — a fact: "this happened"               (past tense: account-opened, money-deposited)
+State    — derived from the event history         (the current truth, reconstructed via left fold)
 ```
 
-- **`evolve`** is a pure fold step: given current state and an event, produce next state
-- **`decide`** is a pure decision: given a command and current state, produce new events (or throw on business rule violation)
-- No I/O, no database, no side effects in the domain
+The Decider itself is a plain Clojure map:
 
-The command handler (`decider.clj`) provides the infrastructure wiring:
+```clojure
+{:initial-state {:status :not-found, :balance 0}  ;; State before any events
+ :decide        decide                             ;; Command → State → [Event]
+ :evolve        evolve}                            ;; State → Event → State
+```
+
+- **`decide`** embodies the business rules: given what is requested (command) and what is true (state), produce new facts (events) -- or reject the command. This is the most important function.
+- **`evolve`** is a pure fold step: given current state and what happened (event), compute the next state. Typically simple -- setting fields, adjusting balances.
+- **`initial-state`** is the state before anything has occurred.
+
+The Decider is **pure**: no I/O, no database, no side effects. The same Decider can run in-memory for tests, against PostgreSQL in production, or in a REPL with hand-crafted event vectors. Domain logic never changes when infrastructure changes.
+
+The command handler (`decider.clj`) provides the infrastructure wiring using Tellman's Pull-Transform-Push:
 
 1. **Pull** -- load events from the store (I/O)
-2. **Transform** -- `reduce evolve initial-state events`, then `decide command state` (pure)
+2. **Transform** -- `(reduce evolve initial-state events)` reconstructs current state, then `(decide command state)` produces new events (pure)
 3. **Push** -- append new events to the store (I/O)
 
 ### Event Store
@@ -133,6 +144,7 @@ src/event_sourcing/
 ├── account.clj               # Account domain model (the Decider) -- pure, no I/O
 ├── transfer.clj              # Transfer domain model (the Decider) -- pure, no I/O
 ├── transfer_saga.clj         # Saga coordinator for cross-account transfers
+├── decider_kit.clj           # Data-driven toolkit for building Deciders
 ├── decider.clj               # Command handler (Pull -> Transform -> Push)
 ├── store.clj                 # Append-only event store (PostgreSQL)
 ├── projection.clj            # Read model catch-up and rebuild
@@ -314,8 +326,10 @@ All DB-backed tests use Testcontainers (PostgreSQL 16 Alpine) -- no external dat
 
 **Event versioning as a domain concern** -- Upcasters live in the domain layer alongside the schemas they transform. The store is version-agnostic; it stores whatever version it receives and passes `event_version` through on read.
 
+**Data-driven Deciders** -- Command validation, event validation, upcasting, and dispatch are shared infrastructure (`decider_kit.clj`). Domain files declare schemas and upcasters as data, then wire through five factory functions. Adding a new aggregate means writing schemas, `evolve`, and decision functions — no boilerplate to copy.
+
 ## References
 
-- Jrme Chassaing -- [The Decider Pattern](https://thinkbeforecoding.com/post/2021/12/17/functional-event-sourcing-decider)
+- Jérôme Chassaing -- [Functional Event Sourcing: Decider](https://thinkbeforecoding.com/post/2021/12/17/functional-event-sourcing-decider) -- the pattern this project implements
 - Zach Tellman -- *Elements of Clojure* (Pull, Transform, Push)
 - Greg Young -- Event Sourcing and CQRS

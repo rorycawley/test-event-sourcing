@@ -1,5 +1,5 @@
 (ns event-sourcing.projection
-  "Read model: a flat account_balances table projected from the event stream.
+  "Read model projection: derived, disposable views built from the event stream.
 
    ┌────────────────────────────────────────────────────────────────┐
    │  READ MODEL vs EVENT STREAM                                    │
@@ -8,10 +8,10 @@
    │    The authoritative source of truth. Append-only, immutable.  │
    │    One stream per aggregate (stream_id = account id).          │
    │                                                                │
-   │  Read model (account_balances table):                          │
-   │    A derived, query-optimised view. Disposable — can be         │
+   │  Read models (account_balances, transfer_status):              │
+   │    Derived, query-optimised views. Disposable — can be          │
    │    rebuilt from the event stream at any time.                   │
-   │    Tracks last_global_sequence for idempotent catch-up.         │
+   │    Track last_global_sequence for idempotent catch-up.          │
    │                                                                 │
    │  Correctness model: fail-fast + transactional checkpointing.    │
    │  If any event cannot be applied (invariant violation, unknown   │
@@ -27,17 +27,14 @@
 
 ;; ——— Projection identity/locking ———
 
-(def ^:private projection-name "account_balances")
+(def ^:private projection-name "main")
+(def ^:private read-model-tables ["account_balances" "transfer_status"])
 (defn- lock-projection!
   "Acquires a transaction-scoped advisory lock for this projection.
    This serialises projection workers so checkpoint advancement and
    event application are deterministic and race-free."
   [tx]
-  (jdbc/execute-one! tx
-                     ["SELECT pg_advisory_xact_lock(
-                            ('x' || substr(md5(?), 1, 16))::bit(64)::bigint
-                          )"
-                      (str "projection:" projection-name)]))
+  (store/advisory-lock! tx (str "projection:" projection-name)))
 
 ;; ——— Validation helpers ———
 
@@ -49,7 +46,7 @@
       0))
 
 (defn- ensure-single-row-updated!
-  "Money events must update exactly one read-model row.
+  "Update events must affect exactly one read-model row.
    If not, fail fast so the caller's transaction rolls back and
    checkpoint advancement is prevented."
   [result event]
@@ -69,9 +66,7 @@
       (update :event-version #(or % 1))))
 
 (defn- project-event!
-  "Applies one event to the read model.
-   For money events, exactly one row must be updated; otherwise we
-   throw and force a transaction rollback."
+  "Applies one event to the read model via multimethod dispatch."
   [tx event]
   (projection-dispatch/project-event!
    tx
@@ -140,8 +135,8 @@
   [ds]
   (jdbc/with-transaction [tx ds]
     (lock-projection! tx)
-    (jdbc/execute-one! tx ["DELETE FROM account_balances"])
-    (jdbc/execute-one! tx ["DELETE FROM transfer_status"])
+    (doseq [table read-model-tables]
+      (jdbc/execute-one! tx [(str "DELETE FROM " table)]))
     (jdbc/execute-one! tx ["DELETE FROM projection_checkpoints"])
     (let [all-events
           (mapv decode-event-row

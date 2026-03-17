@@ -1,28 +1,26 @@
 (ns event-sourcing.decider
-  "Generic Decider infrastructure.
+  "Generic Decider infrastructure — the bridge between pure domain and I/O.
 
-   A Decider is a plain map:
+   A Decider (Chassaing) is a plain map:
 
-     {:initial-state  State
-      :decide         Command → State → Event list
-      :evolve         State → Event → State}
+     {:initial-state  State                      ;; before any events
+      :decide         Command → State → [Event]  ;; intent + truth → facts
+      :evolve         State → Event → State}     ;; truth + fact → new truth
 
-   This namespace provides the machinery to run any Decider
-   against the event store. The domain (account, order, invoice)
-   supplies the Decider map. This namespace supplies the wiring.
+   The Decider is pure — no I/O, no database. This namespace provides
+   the infrastructure wiring to run any Decider against the event store.
+   The domain (account, transfer) supplies the Decider map. This
+   namespace supplies Pull → Transform → Push (Tellman):
 
    ┌──────────────────────────────────────────────────────────────┐
-   │  Pull → Transform → Push   (Tellman, Elements of Clojure)  │
-   │                                                              │
    │  Pull:      load events from the store (I/O)                │
-   │  Transform: evolve events → state, decide → new events      │
-   │             (pure — no side effects)                         │
+   │  Transform: reduce evolve initial-state events → state      │
+   │             decide command state → new events (pure)         │
    │  Push:      append new events to the store (I/O)            │
    └──────────────────────────────────────────────────────────────┘
 
    The domain namespace knows nothing about the store, the database,
-   or this namespace. It's pure data and pure functions. This
-  namespace is the bridge between pure domain and the outside world."
+   or this namespace. It's pure data and pure functions."
   (:require [event-sourcing.schema :as schema]
             [event-sourcing.store :as store]
             [malli.core :as m]))

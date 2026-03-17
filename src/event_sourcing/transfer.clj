@@ -1,13 +1,20 @@
 (ns event-sourcing.transfer
-  "Fund transfer domain — the transfer Decider.
+  "Fund transfer domain — the transfer Decider (Chassaing).
+
+   Commands (intent):  :initiate-transfer, :record-debit, :record-credit,
+                       :complete-transfer, :fail-transfer
+   Events (facts):     transfer-initiated, debit-recorded, credit-recorded,
+                       transfer-completed, transfer-failed
+   State (truth):      {:status :not-found|:initiated|:debited|:credited|
+                                :completed|:failed, ...}
 
    Models a transfer between two accounts as its own aggregate
-   with a lifecycle: initiated → debited → completed (or failed).
+   with a state machine: not-found → initiated → debited → credited
+   → completed (or → failed from any non-terminal state).
 
-   This is a saga/process manager expressed as a Decider.
-   The transfer stream tracks the progress of the cross-account
-   operation, while the actual balance changes happen on the
-   account streams (coordinated by transfer-saga.clj).
+   This is a saga/process manager expressed as a Decider. The transfer
+   stream tracks progress; actual balance changes happen on the account
+   streams (coordinated by transfer_saga.clj).
 
    Everything here is pure: no I/O, no database, no side effects."
   (:require [event-sourcing.decider-kit :as kit]
