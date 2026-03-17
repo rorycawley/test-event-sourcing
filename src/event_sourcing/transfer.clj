@@ -198,8 +198,8 @@
                     {:error/type :domain/same-account-transfer
                      :account    from-account})))
   [(mk-event "transfer-initiated" {:from-account from-account
-                                    :to-account   to-account
-                                    :amount       amount})])
+                                   :to-account   to-account
+                                   :amount       amount})])
 
 (defn- decide-record-debit [state {:keys [account-id amount]}]
   (when-not (= :initiated (:status state))
@@ -218,7 +218,7 @@
                      :expected   (:amount state)
                      :actual     amount})))
   [(mk-event "debit-recorded" {:account-id account-id
-                                :amount     amount})])
+                               :amount     amount})])
 
 (defn- decide-record-credit [state {:keys [account-id amount]}]
   (when-not (= :debited (:status state))
@@ -237,7 +237,7 @@
                      :expected   (:amount state)
                      :actual     amount})))
   [(mk-event "credit-recorded" {:account-id account-id
-                                 :amount     amount})])
+                                :amount     amount})])
 
 (defn- decide-complete [state _data]
   (when-not (= :credited (:status state))

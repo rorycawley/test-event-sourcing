@@ -5,7 +5,6 @@
             [event-sourcing.decider :as decider]
             [event-sourcing.projection :as projection]
             [event-sourcing.store :as store]
-            [event-sourcing.transfer :as transfer]
             [event-sourcing.transfer-saga :as saga]
             [event-sourcing.test-support :as support]))
 
@@ -157,7 +156,7 @@
   (is (= 250 (:balance (projection/get-balance support/*ds* "alice"))))
   (is (= 150 (:balance (projection/get-balance support/*ds* "bob"))))
   (is (= "completed" (:status (projection/get-transfer support/*ds*
-                                                        "transfer-tx-rebuild")))))
+                                                       "transfer-tx-rebuild")))))
 
 ;; ——— Idempotency: re-executing the same transfer is safe ———
 
