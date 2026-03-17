@@ -276,6 +276,35 @@
   (projection/process-new-events! ds)
   (projection/get-balance ds "account-42")
 
+  ;; 9c. Resume a completed transfer (no-op):
+  (saga/resume! ds "tx-001")
+  ;; => {:status :already-completed}
+
+  ;; 9d. Resume a failed transfer (no-op):
+  (saga/resume! ds "tx-002")
+  ;; => {:status :already-failed, :reason "insufficient-funds"}
+
+  ;; 9e. Simulate crash recovery: write only the initiate event
+  ;;     (as if the process died right after step 1), then resume.
+  (store/append-events! ds "transfer-tx-crash" 0
+                        "seed-crash"
+                        {:command-type :seed :data {}}
+                        [{:event-type    "transfer-initiated"
+                          :event-version 1
+                          :payload       {:from-account "account-42"
+                                          :to-account   "account-99"
+                                          :amount       15}}])
+  (saga/resume! ds "tx-crash")
+  ;; => {:status :completed}
+  ;; The saga read the transfer stream, saw :initiated, and
+  ;; completed the remaining steps (debit, credit, complete).
+
+  (projection/process-new-events! ds)
+  (projection/get-balance ds "account-42")
+  ;; => Alice's balance decreased by 15
+  (projection/get-balance ds "account-99")
+  ;; => Bob's balance increased by 15
+
   ;; Transfer domain is also pure — test without a database:
   (transfer/decide {:command-type :initiate-transfer
                     :data         {:from-account "a" :to-account "b" :amount 50}}

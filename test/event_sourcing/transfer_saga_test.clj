@@ -5,6 +5,7 @@
             [event-sourcing.decider :as decider]
             [event-sourcing.projection :as projection]
             [event-sourcing.store :as store]
+            [event-sourcing.transfer :as transfer]
             [event-sourcing.transfer-saga :as saga]
             [event-sourcing.test-support :as support]))
 
@@ -176,3 +177,170 @@
                                           (store/load-stream support/*ds* "bob"))]
     (is (= 160 (:balance alice-state)))
     (is (= 90 (:balance bob-state)))))
+
+;; ═══════════════════════════════════════════════════
+;; Resume — crash recovery
+;; ═══════════════════════════════════════════════════
+;;
+;; These tests simulate mid-saga crashes by writing transfer
+;; events directly to the store (bypassing the saga), then
+;; calling resume! to continue from the last persisted step.
+
+(defn- write-transfer-events!
+  "Writes raw transfer events to a stream, simulating partial saga progress."
+  [stream-id events]
+  (store/append-events! support/*ds*
+                        stream-id
+                        0
+                        (str "seed-" stream-id)
+                        {:command-type :seed :data {:case :resume-test}}
+                        events))
+
+(deftest resume-from-initiated-completes-transfer
+  ;; Simulate: saga wrote transfer-initiated, then process crashed
+  ;; before debiting the source account.
+  (open-and-fund! "alice" "Alice" 200)
+  (open-and-fund! "bob" "Bob" 50)
+
+  (write-transfer-events!
+   "transfer-tx-resume-1"
+   [{:event-type    "transfer-initiated"
+     :event-version 1
+     :payload       {:from-account "alice"
+                     :to-account   "bob"
+                     :amount       60}}])
+
+  ;; Resume picks up from :initiated and finishes the transfer
+  (let [result (saga/resume! support/*ds* "tx-resume-1")]
+    (is (= :completed (:status result))))
+
+  ;; Balances correct
+  (let [alice (decider/evolve-state account/decider
+                                    (store/load-stream support/*ds* "alice"))
+        bob   (decider/evolve-state account/decider
+                                    (store/load-stream support/*ds* "bob"))]
+    (is (= 140 (:balance alice)))
+    (is (= 110 (:balance bob))))
+
+  ;; Transfer stream has all 4 events
+  (is (= ["transfer-initiated" "debit-recorded"
+          "credit-recorded" "transfer-completed"]
+         (mapv :event-type
+               (store/load-stream support/*ds* "transfer-tx-resume-1")))))
+
+(deftest resume-from-debited-completes-transfer
+  ;; Simulate: debit succeeded and was recorded on transfer stream,
+  ;; but process crashed before crediting the destination.
+  ;; This is the dangerous case — money has left Alice's account.
+  (open-and-fund! "alice" "Alice" 200)
+  (open-and-fund! "bob" "Bob" 50)
+
+  ;; Manually debit Alice (as the saga would have)
+  (decider/handle! support/*ds* account/decider
+                   {:command-type    :withdraw
+                    :stream-id       "alice"
+                    :idempotency-key "transfer-tx-resume-2-debit"
+                    :data            {:amount 80}})
+
+  (write-transfer-events!
+   "transfer-tx-resume-2"
+   [{:event-type    "transfer-initiated"
+     :event-version 1
+     :payload       {:from-account "alice"
+                     :to-account   "bob"
+                     :amount       80}}])
+  ;; Advance stream to include debit-recorded
+  (store/append-events! support/*ds*
+                        "transfer-tx-resume-2"
+                        1
+                        "seed-transfer-tx-resume-2-debit"
+                        {:command-type :seed :data {:case :resume-debit}}
+                        [{:event-type    "debit-recorded"
+                          :event-version 1
+                          :payload       {:account-id "alice"
+                                          :amount     80}}])
+
+  ;; Resume picks up from :debited — credits Bob and completes
+  (let [result (saga/resume! support/*ds* "tx-resume-2")]
+    (is (= :completed (:status result))))
+
+  (let [alice (decider/evolve-state account/decider
+                                    (store/load-stream support/*ds* "alice"))
+        bob   (decider/evolve-state account/decider
+                                    (store/load-stream support/*ds* "bob"))]
+    (is (= 120 (:balance alice)))
+    (is (= 130 (:balance bob)))))
+
+(deftest resume-from-credited-completes-transfer
+  ;; Simulate: both accounts updated, credit-recorded written,
+  ;; but process crashed before writing transfer-completed.
+  (open-and-fund! "alice" "Alice" 200)
+  (open-and-fund! "bob" "Bob" 50)
+
+  ;; Manually perform the account operations
+  (decider/handle! support/*ds* account/decider
+                   {:command-type    :withdraw
+                    :stream-id       "alice"
+                    :idempotency-key "transfer-tx-resume-3-debit"
+                    :data            {:amount 30}})
+  (decider/handle! support/*ds* account/decider
+                   {:command-type    :deposit
+                    :stream-id       "bob"
+                    :idempotency-key "transfer-tx-resume-3-credit"
+                    :data            {:amount 30}})
+
+  (write-transfer-events!
+   "transfer-tx-resume-3"
+   [{:event-type    "transfer-initiated"
+     :event-version 1
+     :payload       {:from-account "alice"
+                     :to-account   "bob"
+                     :amount       30}}])
+  (store/append-events! support/*ds* "transfer-tx-resume-3" 1
+                        "seed-tx-resume-3-debit"
+                        {:command-type :seed :data {}}
+                        [{:event-type    "debit-recorded"
+                          :event-version 1
+                          :payload       {:account-id "alice" :amount 30}}])
+  (store/append-events! support/*ds* "transfer-tx-resume-3" 2
+                        "seed-tx-resume-3-credit"
+                        {:command-type :seed :data {}}
+                        [{:event-type    "credit-recorded"
+                          :event-version 1
+                          :payload       {:account-id "bob" :amount 30}}])
+
+  ;; Resume picks up from :credited — just marks complete
+  (let [result (saga/resume! support/*ds* "tx-resume-3")]
+    (is (= :completed (:status result))))
+
+  (is (= ["transfer-initiated" "debit-recorded"
+          "credit-recorded" "transfer-completed"]
+         (mapv :event-type
+               (store/load-stream support/*ds* "transfer-tx-resume-3")))))
+
+(deftest resume-completed-transfer-returns-already-completed
+  (open-and-fund! "alice" "Alice" 200)
+  (open-and-fund! "bob" "Bob" 50)
+
+  (saga/execute! support/*ds* "tx-resume-done" "alice" "bob" 25)
+
+  (let [result (saga/resume! support/*ds* "tx-resume-done")]
+    (is (= :already-completed (:status result)))))
+
+(deftest resume-failed-transfer-returns-already-failed
+  (open-and-fund! "alice" "Alice" 10)
+  (open-and-fund! "bob" "Bob" 0)
+
+  (saga/execute! support/*ds* "tx-resume-fail" "alice" "bob" 999)
+
+  (let [result (saga/resume! support/*ds* "tx-resume-fail")]
+    (is (= :already-failed (:status result)))
+    (is (= "insufficient-funds" (:reason result)))))
+
+(deftest resume-nonexistent-transfer-throws
+  (let [e (try
+            (saga/resume! support/*ds* "no-such-transfer")
+            nil
+            (catch clojure.lang.ExceptionInfo ex ex))]
+    (is (some? e))
+    (is (= :saga/transfer-not-found (:error/type (ex-data e))))))

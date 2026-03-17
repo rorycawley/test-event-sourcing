@@ -115,6 +115,8 @@ The transfer saga (`transfer_saga.clj`) demonstrates cross-aggregate coordinatio
 
 The transfer is its own Decider (`transfer.clj`) with a state machine: `not-found → initiated → debited → credited → completed` (or `→ failed` from any non-terminal state). The saga coordinator uses idempotency keys derived from the transfer-id, so every step is safe to retry.
 
+**Crash recovery**: if the process dies mid-transfer, `resume!` reads the transfer stream, evolves to the current state, and picks up from the last completed step. Because every step is idempotent, resumption is always safe — money is never lost or duplicated.
+
 ### Projections
 
 The read model (`projection.clj`) is a derived, disposable view built from the event stream:
