@@ -2,40 +2,38 @@
 
 A reference implementation of event sourcing using the **Decider pattern** (Chassaing) and **Pull-Transform-Push** (Tellman), backed by PostgreSQL.
 
-Implements a bank account domain to demonstrate: append-only event storage, optimistic concurrency with retry, command idempotency, event versioning with upcasting, projections (derived read models), and cross-aggregate saga coordination (fund transfers).
+Implements a bank account domain to demonstrate: append-only event storage, optimistic concurrency with retry, command idempotency, event versioning with upcasting, data-driven projections, and cross-aggregate saga coordination (fund transfers).
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Command Handler (decider.clj)                │
-│                                                                 │
-│   Pull           Transform              Push                    │
-│   ┌──────┐       ┌────────────────┐     ┌──────────────────┐   │
-│   │ Load │       │ Evolve state   │     │ Append events    │   │
-│   │ event│──────▶│ (left fold)    │────▶│ with optimistic  │   │
-│   │stream│       │ Decide new     │     │ concurrency +    │   │
-│   │      │       │ events (pure)  │     │ idempotency      │   │
-│   └──────┘       └────────────────┘     └──────────────────┘   │
-│       │                                         │               │
-│       ▼                                         ▼               │
-│  ┌──────────────────────────────────────────────────┐           │
-│  │              PostgreSQL (store.clj)              │           │
-│  │                                                  │           │
-│  │  events table          idempotency_keys table    │           │
-│  │  (append-only log)     (command deduplication)   │           │
-│  └──────────────────────────────────────────────────┘           │
-│                         │                                       │
-│                         ▼                                       │
-│            ┌──────────────────────┐                             │
-│            │  Projection          │                             │
-│            │  (projection.clj)    │                             │
-│            │                      │                             │
-│            │  account_balances    │                             │
-│            │  transfer_status     │                             │
-│            │  (derived read models)│                            │
-│            └──────────────────────┘                             │
-└─────────────────────────────────────────────────────────────────┘
+                          COMMAND FLOW
+  ┌─────────┐    ┌──────────────────────┐    ┌───────────────────┐
+  │         │    │       Decider        │    │      Store        │
+  │ Command │───>│                      │───>│                   │
+  │         │    │  decide() -> [Event] │    │  append-events!   │
+  └─────────┘    │  evolve() -> State   │    │  (append-only     │
+                 │                      │    │   event log in    │
+                 │  Pure functions —    │    │   PostgreSQL)     │
+                 │  no I/O, no DB      │    │                   │
+                 └──────────────────────┘    └─────────┬─────────┘
+                                                       │
+                          PROJECTION FLOW              │
+  ┌──────────────┐    ┌────────────────────┐    ┌──────┴──────┐
+  │  Read Model  │<───│    Projection      │<───│   Events    │
+  │              │    │                    │    │   table     │
+  │  - balances  │    │  process-new-      │    │             │
+  │  - transfers │    │   events!          │    │  (global    │
+  │              │    │  (data-driven      │    │   sequence  │
+  │  Disposable, │    │   handler per      │    │   cursor)   │
+  │  rebuildable │    │   event type)      │    │             │
+  └──────────────┘    └────────────────────┘    └─────────────┘
+
+                          SAGA FLOW (cross-stream coordination)
+  ┌────────┐    ┌───────────┐    ┌───────────┐    ┌───────────┐
+  │  Saga  │───>│ Decider A │───>│ Decider B │───>│ Decider C │
+  │        │    │  (debit)  │    │  (credit) │    │ (complete)│
+  └────────┘    └───────────┘    └───────────┘    └───────────┘
 ```
 
 ### The Decider Pattern
@@ -56,21 +54,31 @@ The Decider itself is a plain Clojure map:
  :evolve        evolve}                            ;; State → Event → State
 ```
 
-- **`decide`** embodies the business rules: given what is requested (command) and what is true (state), produce new facts (events) -- or reject the command. This is the most important function.
-- **`evolve`** is a pure fold step: given current state and what happened (event), compute the next state. Typically simple -- setting fields, adjusting balances.
+- **`decide`** embodies the business rules: given what is requested (command) and what is true (state), produce new facts (events) -- or reject the command.
+- **`evolve`** is a pure fold step: given current state and what happened (event), compute the next state.
 - **`initial-state`** is the state before anything has occurred.
 
 The Decider is **pure**: no I/O, no database, no side effects. The same Decider can run in-memory for tests, against PostgreSQL in production, or in a REPL with hand-crafted event vectors. Domain logic never changes when infrastructure changes.
 
-The command handler (`decider.clj`) provides the infrastructure wiring using Tellman's Pull-Transform-Push:
+The command handler (`es.decider`) provides the infrastructure wiring using Tellman's Pull-Transform-Push:
 
 1. **Pull** -- load events from the store (I/O)
 2. **Transform** -- `(reduce evolve initial-state events)` reconstructs current state, then `(decide command state)` produces new events (pure)
 3. **Push** -- append new events to the store (I/O)
 
+### Data-Driven Toolkit
+
+Both deciders and projections are built from **data declarations**, not boilerplate:
+
+- **`es.decider-kit`** — Five factory functions that take schemas, upcasters, and decision functions as data and return the wired-up functions. Event schemas are declared as payload-only maps; the envelope (`event-type`, `event-version`, `payload`) is wrapped automatically.
+
+- **`es.projection-kit`** — `make-handler` takes a map of `{event-type -> handler-fn}` and returns a dispatch function. `make-query` builds reusable query functions. Domain projections declare their handler maps as data; the composition root (`bank.system`) merges them.
+
+Adding a new aggregate means writing schemas, `evolve`, decision functions, and a projection handler map — no macros, no multimethods, no boilerplate to copy.
+
 ### Event Store
 
-The event store (`store.clj`) is an append-only log in PostgreSQL with:
+The event store (`es.store`) is an append-only log in PostgreSQL with:
 
 | Field | Purpose |
 |---|---|
@@ -106,7 +114,7 @@ Old events stored as v1 are transparently upcasted to v3 on read. New events are
 
 ### Fund Transfer Saga
 
-The transfer saga (`transfer_saga.clj`) demonstrates cross-aggregate coordination:
+The transfer saga (`bank.transfer-saga`) demonstrates cross-aggregate coordination:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -124,60 +132,68 @@ The transfer saga (`transfer_saga.clj`) demonstrates cross-aggregate coordinatio
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The transfer is its own Decider (`transfer.clj`) with a state machine: `not-found → initiated → debited → credited → completed` (or `→ failed` from any non-terminal state). The saga coordinator uses idempotency keys derived from the transfer-id, so every step is safe to retry.
+The transfer is its own Decider (`bank.transfer`) with a state machine: `not-found → initiated → debited → credited → completed` (or `→ failed` from any non-terminal state). The saga coordinator uses idempotency keys derived from the transfer-id, so every step is safe to retry.
 
 **Crash recovery**: if the process dies mid-transfer, `resume!` reads the transfer stream, evolves to the current state, and picks up from the last completed step. Because every step is idempotent, resumption is always safe — money is never lost or duplicated.
 
 ### Projections
 
-The read model (`projection.clj`) is a derived, disposable view built from the event stream:
+The read model (`es.projection`) is a derived, disposable view built from the event stream:
 
 - **Catch-up processing**: reads events after last checkpoint, applies them, advances checkpoint
 - **Full rebuild**: destroys and rebuilds from complete event stream
 - **Correctness**: advisory lock serialises workers; all work in one transaction; failure rolls back without advancing checkpoint
-- **Dispatch**: multimethod on `:event-type` (`projection_dispatch.clj`, `account_projection.clj`)
+- **Data-driven dispatch**: handler map built via `es.projection-kit/make-handler`, composed in `bank.system`
 
 ## Project Structure
 
+The codebase is split into two layers: the reusable **framework** (`es.*`) and the **domain** (`bank.*`).
+
 ```
-src/event_sourcing/
-├── account.clj               # Account domain model (the Decider) -- pure, no I/O
-├── transfer.clj              # Transfer domain model (the Decider) -- pure, no I/O
-├── transfer_saga.clj         # Saga coordinator for cross-account transfers
-├── decider_kit.clj           # Data-driven toolkit for building Deciders
-├── decider.clj               # Command handler (Pull -> Transform -> Push)
-├── store.clj                 # Append-only event store (PostgreSQL)
-├── projection.clj            # Read model catch-up and rebuild
-├── projection_dispatch.clj   # Multimethod dispatch for projection handlers
-├── account_projection.clj    # Account event handlers for the projection
-├── transfer_projection.clj   # Transfer event handlers for the projection
-├── schema.clj                # Shared Malli schemas
-├── migrations.clj            # Migratus migration wrapper
-├── migrations_cli.clj        # CLI for running migrations against external DB
-└── infra.clj                 # Testcontainer lifecycle (disposable Postgres)
+src/
+├── es/                          # Reusable event sourcing framework
+│   ├── decider_kit.clj          #   Data-driven Decider factories (schemas → functions)
+│   ├── decider.clj              #   Command handler (Pull → Transform → Push)
+│   ├── store.clj                #   Append-only event store (PostgreSQL)
+│   ├── projection.clj           #   Read model catch-up and rebuild
+│   ├── projection_kit.clj       #   Data-driven projection handler factories
+│   ├── schema.clj               #   Shared Malli schemas
+│   ├── migrations.clj           #   Migratus migration wrapper
+│   ├── migrations_cli.clj       #   CLI for running migrations against external DB
+│   └── infra.clj                #   Testcontainer lifecycle (disposable Postgres)
+│
+├── bank/                        # Domain-specific code
+│   ├── account.clj              #   Account Decider (decide/evolve) — pure, no I/O
+│   ├── transfer.clj             #   Transfer Decider (decide/evolve) — pure, no I/O
+│   ├── transfer_saga.clj        #   Saga coordinator for cross-account transfers
+│   ├── account_projection.clj   #   Account projection handler specs + query
+│   ├── transfer_projection.clj  #   Transfer projection handler specs + query
+│   └── system.clj               #   Composition root (wires framework + domain)
 
 dev/
-└── user.clj                  # Interactive REPL walkthrough (10 steps)
+└── user.clj                     # Interactive REPL walkthrough (10 steps)
 
-test/event_sourcing/
-├── account_test.clj          # Pure account domain unit tests (no DB)
-├── transfer_test.clj         # Pure transfer domain unit tests (no DB)
-├── transfer_saga_test.clj    # Transfer saga integration tests (DB)
-├── decider_test.clj          # Command handler tests (mocked store)
-├── store_test.clj            # Store utility unit tests
-├── store_integration_test.clj # Event store integration tests (DB)
-├── functional_test.clj       # End-to-end lifecycle tests (DB)
-├── integration_test.clj      # Comprehensive integration tests (DB)
-├── fuzz_unit_test.clj        # Property-based domain tests
-├── fuzz_integration_test.clj # Property-based integration tests (DB)
-├── migrations_test.clj       # Migration wrapper tests
-├── migrations_cli_test.clj   # CLI interface tests
-├── perf.clj                  # Performance benchmarks
-├── perf_check.clj            # Regression detection vs baseline
-├── perf_baseline.clj         # Baseline management
-└── test_support.clj          # Test fixtures and utilities
+test/
+├── bank/
+│   ├── account_test.clj         #   Pure account domain unit tests (no DB)
+│   ├── transfer_test.clj        #   Pure transfer domain unit tests (no DB)
+│   ├── transfer_saga_test.clj   #   Transfer saga integration tests (DB)
+│   ├── functional_test.clj      #   End-to-end lifecycle tests (DB)
+│   ├── integration_test.clj     #   Concurrency, idempotency, projection tests (DB)
+│   ├── fuzz_unit_test.clj       #   Property-based domain tests
+│   ├── fuzz_integration_test.clj#   Property-based integration tests (DB)
+│   ├── perf.clj                 #   Performance benchmarks
+│   ├── perf_check.clj           #   Regression detection vs baseline
+│   ├── perf_baseline.clj        #   Baseline management
+│   └── test_support.clj         #   Test fixtures and utilities
+├── es/
+│   ├── decider_test.clj         #   Command handler tests (mocked store)
+│   ├── store_test.clj           #   Store utility unit tests
+│   ├── store_integration_test.clj#  Event store integration tests (DB)
+│   ├── migrations_test.clj      #   Migration wrapper tests
+│   └── migrations_cli_test.clj  #   CLI interface tests
 
-resources/migrations/          # SQL migrations (Migratus)
+resources/migrations/             # SQL migrations (Migratus)
 ```
 
 ## Database Schema
@@ -256,9 +272,6 @@ bb fuzz
 
 # Quick checks (lint + format + compile)
 bb check
-
-# Code coverage (88% threshold)
-bb coverage
 ```
 
 ### Performance Benchmarks
@@ -287,12 +300,65 @@ bb rollback
 bb migration-status
 ```
 
+## Claude Code + REPL Integration
+
+This project is set up for **REPL-driven development with Claude Code**. Claude can evaluate Clojure code directly against a running nREPL server, enabling an interactive workflow where it edits code, loads it into the REPL, tests it, and iterates — the same workflow a human Clojure developer uses.
+
+### How it works
+
+The integration uses two CLI tools configured in `CLAUDE.md`:
+
+**`clj-nrepl-eval`** — Evaluates Clojure code against an nREPL server. Session state persists between evaluations, so Claude can require a namespace in one call and use it in subsequent calls.
+
+```bash
+# Discover running nREPL servers in the project
+clj-nrepl-eval --discover-ports
+
+# Evaluate code against a specific port
+clj-nrepl-eval -p <port> "(require '[bank.account :as account] :reload)"
+clj-nrepl-eval -p <port> "(account/decide {:command-type :deposit :data {:amount 50}}
+                                           {:status :open :balance 100})"
+
+# Multiline via heredoc
+clj-nrepl-eval -p <port> <<'EOF'
+(require '[bank.account :as account] :reload)
+(account/evolve {:status :open :balance 100}
+                {:event-type "money-deposited" :event-version 3
+                 :payload {:amount 50 :origin "command" :currency "USD"}})
+EOF
+```
+
+**`clj-paren-repair`** — Automatically fixes mismatched parentheses in Clojure files. Configured as a hook so that when Claude writes or edits a `.clj` file, any delimiter errors are repaired before the file is saved.
+
+### Typical Claude Code workflow
+
+1. **Start an nREPL server** — `clj -M:nrepl` (or use the `/start-nrepl` skill)
+2. **Claude discovers the port** — `clj-nrepl-eval --discover-ports`
+3. **Edit-eval-iterate loop:**
+   - Claude edits a source file
+   - Parenthesis repair hook runs automatically
+   - Claude loads the namespace: `(require '[bank.account :as account] :reload)`
+   - Claude evaluates expressions to verify the change works
+   - If something fails, Claude reads the error, adjusts, and re-evaluates
+4. **Run tests** — `bb test` to confirm everything passes
+
+This gives Claude the same tight feedback loop that makes REPL-driven development effective for human developers: write code, load it, try it, fix it, repeat — all without restarting the JVM.
+
+### Configuration
+
+The REPL integration is configured via:
+
+- **`CLAUDE.md`** — Instructions for Claude on how to use `clj-nrepl-eval` and `clj-paren-repair`
+- **`deps.edn` `:nrepl` alias** — Starts an nREPL server with `clj -M:nrepl`
+- **`.claude/settings.local.json`** — Permission rules for the CLI tools
+- **`~/.claude/skills/clojure-eval/`** — Claude Code skill that teaches Claude the REPL evaluation workflow
+
 ## Test Strategy
 
 | Layer | Files | What it tests | DB required |
 |---|---|---|---|
 | Unit | `account_test`, `transfer_test`, `decider_test`, `store_test` | Pure domain logic, command handler wiring, store utilities | No |
-| Functional | `functional_test` | End-to-end lifecycle (open -> deposit -> withdraw -> projection) | Yes |
+| Functional | `functional_test` | End-to-end lifecycle (open → deposit → withdraw → projection) | Yes |
 | Integration | `integration_test`, `store_integration_test`, `transfer_saga_test` | Concurrency, idempotency, migrations, projection correctness, cross-account sagas | Yes |
 | Property-based | `fuzz_unit_test`, `fuzz_integration_test` | Random command sequences never violate invariants; projection rebuild matches incremental | Mixed |
 | Performance | `perf`, `perf_check` | Latency and throughput benchmarks with regression detection | Yes |
@@ -316,7 +382,9 @@ All DB-backed tests use Testcontainers (PostgreSQL 16 Alpine) -- no external dat
 
 ## Key Design Decisions
 
-**Pure domain, infrastructure boundary** -- The domain (`account.clj`) contains no I/O, no timestamps, no sequence numbers. All infrastructure concerns (concurrency, idempotency, persistence) live in `decider.clj` and `store.clj`. This makes the domain trivially testable and portable.
+**Pure domain, infrastructure boundary** -- The domain (`bank.account`, `bank.transfer`) contains no I/O, no timestamps, no sequence numbers. All infrastructure concerns (concurrency, idempotency, persistence) live in `es.decider` and `es.store`. This makes the domain trivially testable and portable.
+
+**Data-driven over boilerplate** -- Both deciders and projections are built from data declarations. `es.decider-kit` takes schema maps and returns wired functions. `es.projection-kit` takes handler maps and returns dispatch functions. Adding a new aggregate requires writing data, not copying machinery.
 
 **Idempotency separated from events** -- Command deduplication uses a dedicated `idempotency_keys` table rather than columns on the events table. This avoids cross-stream races and keeps event rows focused on domain facts.
 
@@ -325,8 +393,6 @@ All DB-backed tests use Testcontainers (PostgreSQL 16 Alpine) -- no external dat
 **Projections are disposable** -- The read model can be destroyed and rebuilt from the event stream at any time. The checkpoint tracks progress using `global_sequence`, not timestamps, ensuring exactly-once processing semantics.
 
 **Event versioning as a domain concern** -- Upcasters live in the domain layer alongside the schemas they transform. The store is version-agnostic; it stores whatever version it receives and passes `event_version` through on read.
-
-**Data-driven Deciders** -- Command validation, event validation, upcasting, and dispatch are shared infrastructure (`decider_kit.clj`). Domain files declare schemas and upcasters as data, then wire through five factory functions. Adding a new aggregate means writing schemas, `evolve`, and decision functions — no boilerplate to copy.
 
 ## References
 

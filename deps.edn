@@ -13,4 +13,8 @@
                                                                 :git/sha "dfb30dd"}}
              :exec-fn    cognitect.test-runner.api/test
              :exec-args  {:dirs ["test"]}}
-  :coverage {:extra-deps {cloverage/cloverage {:mvn/version "1.2.4"}}}}}
+  :coverage {:extra-deps {cloverage/cloverage {:mvn/version "1.2.4"}}}
+  :nrepl    {:extra-paths ["test"]
+             :extra-deps {nrepl/nrepl {:mvn/version "1.3.1"}}
+             :jvm-opts ["-Djdk.attach.allowAttachSelf"]
+             :main-opts ["-m" "nrepl.cmdline"]}}}

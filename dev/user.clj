@@ -6,7 +6,7 @@
      :decide        — Command → State → Event list
      :evolve        — State → Event → State
 
-   The generic handler in event-sourcing.decider implements
+   The generic handler in es.decider implements
    Tellman's Pull → Transform → Push:
      Pull:      load events from the store
      Transform: evolve state, decide new events (pure)
@@ -34,16 +34,18 @@
 ;; saga      — saga coordinator for cross-account transfers
 ;; decider   — generic Pull → Transform → Push handler
 ;; store     — event store (Pull and Push)
-;; projection — read model
+;; system    — composition root (wires projections)
 
-(require '[event-sourcing.infra          :as infra]
-         '[event-sourcing.migrations     :as migrations]
-         '[event-sourcing.store          :as store]
-         '[event-sourcing.decider        :as decider]
-         '[event-sourcing.account        :as account]
-         '[event-sourcing.projection     :as projection]
-         '[event-sourcing.transfer       :as transfer]
-         '[event-sourcing.transfer-saga  :as saga])
+(require '[es.infra                   :as infra]
+         '[es.migrations              :as migrations]
+         '[es.store                   :as store]
+         '[es.decider                 :as decider]
+         '[bank.account               :as account]
+         '[bank.system                :as system]
+         '[bank.account-projection    :as account-projection]
+         '[bank.transfer-projection   :as transfer-projection]
+         '[bank.transfer              :as transfer]
+         '[bank.transfer-saga         :as saga])
 
 ;; ═══════════════════════════════════════════════════
 ;; Step 1 — Start a throwaway Postgres
@@ -150,14 +152,14 @@
   ;; It uses global-sequence (not stream-sequence) as its cursor
   ;; because it processes events from ALL streams in one pass.
 
-  (projection/process-new-events! ds)
+  (system/process-new-events! ds)
   ;; => 4  (four events processed)
 
-  (projection/get-balance ds "account-42")
+  (account-projection/get-balance ds "account-42")
   ;; => {:account-id "account-42", :balance 120, :last-global-sequence 4, ...}
 
   ;; Call again — should return 0 (checkpoint remembers where we left off):
-  (projection/process-new-events! ds)
+  (system/process-new-events! ds)
   ;; => 0
 
   ;; ═══════════════════════════════════════════════════
@@ -218,12 +220,12 @@
   ;; => :ok
 
   ;; Update read model and check final balance:
-  (projection/process-new-events! ds)
-  (projection/get-balance ds "account-42")
+  (system/process-new-events! ds)
+  (account-projection/get-balance ds "account-42")
 
   ;; Full rebuild of read model (proves it's disposable):
-  (projection/rebuild! ds)
-  (projection/get-balance ds "account-42")
+  (system/rebuild! ds)
+  (account-projection/get-balance ds "account-42")
 
   ;; ═══════════════════════════════════════════════════
   ;; Step 9 — Fund transfer saga (cross-account)
@@ -254,10 +256,10 @@
   ;; => {:status :completed}
 
   ;; Check balances after transfer:
-  (projection/process-new-events! ds)
-  (projection/get-balance ds "account-42")
+  (system/process-new-events! ds)
+  (account-projection/get-balance ds "account-42")
   ;; => {:balance 70, ...}  (was 110, minus 40)
-  (projection/get-balance ds "account-99")
+  (account-projection/get-balance ds "account-99")
   ;; => {:balance 240, ...}  (was 200, plus 40)
 
   ;; Inspect the transfer stream — tracks saga progress:
@@ -266,7 +268,7 @@
   ;;     "credit-recorded" "transfer-completed"]
 
   ;; View projected transfer status:
-  (projection/get-transfer ds "transfer-tx-001")
+  (transfer-projection/get-transfer ds "transfer-tx-001")
   ;; => {:transfer-id "transfer-tx-001", :status "completed", ...}
 
   ;; 9b. Transfer with insufficient funds fails gracefully:
@@ -274,8 +276,8 @@
   ;; => {:status :failed, :reason "insufficient-funds"}
 
   ;; Alice's balance unchanged:
-  (projection/process-new-events! ds)
-  (projection/get-balance ds "account-42")
+  (system/process-new-events! ds)
+  (account-projection/get-balance ds "account-42")
 
   ;; 9c. Resume a completed transfer (no-op):
   (saga/resume! ds "tx-001")
@@ -300,10 +302,10 @@
   ;; The saga read the transfer stream, saw :initiated, and
   ;; completed the remaining steps (debit, credit, complete).
 
-  (projection/process-new-events! ds)
-  (projection/get-balance ds "account-42")
+  (system/process-new-events! ds)
+  (account-projection/get-balance ds "account-42")
   ;; => Alice's balance decreased by 15
-  (projection/get-balance ds "account-99")
+  (account-projection/get-balance ds "account-99")
   ;; => Bob's balance increased by 15
 
   ;; Transfer domain is also pure — test without a database:

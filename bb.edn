@@ -30,35 +30,35 @@
 
   perf
   {:doc "Run deterministic performance benchmarks and write target/perf results"
-   :task (shell "clj" "-M:test" "-m" "event-sourcing.perf")}
+   :task (shell "clj" "-M:test" "-m" "bank.perf")}
 
   perf-check
   {:doc "Fail when perf metrics regress beyond configured threshold vs perf/baseline.edn"
    :depends [perf]
-   :task (shell "clj" "-M:test" "-m" "event-sourcing.perf-check")}
+   :task (shell "clj" "-M:test" "-m" "bank.perf-check")}
 
   perf-baseline
   {:doc "Update perf/baseline.edn from the latest target/perf/results.edn"
-   :task (shell "clj" "-M:test" "-m" "event-sourcing.perf-baseline")}
+   :task (shell "clj" "-M:test" "-m" "bank.perf-baseline")}
 
   migrate
   {:doc "Apply pending DB migrations (requires JDBC_URL, optional DB_USER/DB_PASSWORD)"
-   :task (shell "clj" "-M" "-m" "event-sourcing.migrations-cli" "migrate")}
+   :task (shell "clj" "-M" "-m" "es.migrations-cli" "migrate")}
 
   rollback
   {:doc "Rollback the latest DB migration (requires JDBC_URL, optional DB_USER/DB_PASSWORD)"
-   :task (shell "clj" "-M" "-m" "event-sourcing.migrations-cli" "rollback")}
+   :task (shell "clj" "-M" "-m" "es.migrations-cli" "rollback")}
 
   migration-status
   {:doc "Show completed and pending DB migrations (requires JDBC_URL, optional DB_USER/DB_PASSWORD)"
-   :task (shell "clj" "-M" "-m" "event-sourcing.migrations-cli" "status")}
+   :task (shell "clj" "-M" "-m" "es.migrations-cli" "status")}
 
   coverage
   {:doc "Generate coverage report (DB-backed tests require Docker/Testcontainers)"
    :task (shell "clj" "-M:test:coverage" "-m" "cloverage.coverage"
                 "--src-ns-path" "src"
                 "--test-ns-path" "test"
-                "--ns-regex" "event-sourcing.*"
+                "--ns-regex" "(es|bank).*"
                 "--fail-threshold" "88"
                 "--output" "target/coverage"
                 "--codecov")}
