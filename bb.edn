@@ -42,11 +42,19 @@
    :task (shell "clj" "-M:test" "-m" "bank.perf-baseline")}
 
   migrate
-  {:doc "Apply pending DB migrations (requires JDBC_URL, optional DB_USER/DB_PASSWORD)"
+  {:doc "Apply pending event store migrations (requires JDBC_URL, optional DB_USER/DB_PASSWORD)"
    :task (shell "clj" "-M" "-m" "es.migrations-cli" "migrate")}
 
+  migrate-read
+  {:doc "Apply pending read store migrations (requires JDBC_URL pointing to read DB)"
+   :task (shell "clj" "-M" "-m" "es.migrations-cli" "migrate" "read-migrations")}
+
+  migrate-notification
+  {:doc "Apply pending notification DB migrations (requires JDBC_URL pointing to notification DB)"
+   :task (shell "clj" "-M" "-m" "es.migrations-cli" "migrate" "notification-migrations")}
+
   rollback
-  {:doc "Rollback the latest DB migration (requires JDBC_URL, optional DB_USER/DB_PASSWORD)"
+  {:doc "Rollback the latest event store migration (requires JDBC_URL, optional DB_USER/DB_PASSWORD)"
    :task (shell "clj" "-M" "-m" "es.migrations-cli" "rollback")}
 
   migration-status

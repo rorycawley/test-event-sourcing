@@ -42,9 +42,9 @@
       (println " -" (pr-str row)))))
 
 (defn- status!
-  [ds]
-  (let [completed (sort (migrations/completed ds))
-        pending (sort (migrations/pending ds))]
+  [ds opts]
+  (let [completed (sort (migrations/completed ds opts))
+        pending   (sort (migrations/pending ds opts))]
     (print-migration-list "Completed migrations" completed)
     (print-migration-list "Pending migrations" pending)
     {:completed completed
@@ -53,28 +53,45 @@
 (def ^:private known-commands
   #{"migrate" "rollback" "status"})
 
+(defn- usage! []
+  (binding [*out* *err*]
+    (println "Usage: clj -M -m es.migrations-cli [migrate|rollback|status] [migration-dir]")
+    (println "")
+    (println "migration-dir:")
+    (println "  migrations               Event store (default)")
+    (println "  read-migrations          Read store")
+    (println "  notification-migrations  Notification database"))
+  (*exit-fn* 1))
+
 (defn -main
-  [& [command]]
-  (let [command (or command "status")]
-    (if (contains? known-commands command)
-      (let [ds (datasource-from-env!)]
-        (case command
-          "migrate"
-          (do
-            (migrations/migrate! ds)
+  "Runs migration commands against a database specified by JDBC_URL.
+
+   Usage: clj -M -m es.migrations-cli [migrate|rollback|status] [migration-dir]
+
+   migration-dir defaults to \"migrations\" (event store schema).
+   Use \"read-migrations\" for the read store or \"notification-migrations\"
+   for the notification database."
+  [& [command migration-dir]]
+  (let [command (or command "status")
+        opts    (cond-> {}
+                  migration-dir (assoc :migration-dir migration-dir))]
+    (when-not (contains? known-commands command)
+      (binding [*out* *err*]
+        (println "Unknown migration command:" command))
+      (usage!))
+    (let [ds (datasource-from-env!)]
+      (when migration-dir
+        (println (str "Using migration directory: " migration-dir)))
+      (case command
+        "migrate"
+        (do (migrations/migrate! ds opts)
             (println "Applied pending migrations.")
-            (status! ds))
+            (status! ds opts))
 
-          "rollback"
-          (do
-            (migrations/rollback! ds)
+        "rollback"
+        (do (migrations/rollback! ds opts)
             (println "Rolled back the most recent migration.")
-            (status! ds))
+            (status! ds opts))
 
-          "status"
-          (status! ds)))
-      (do
-        (binding [*out* *err*]
-          (println "Unknown migration command:" command)
-          (println "Usage: clj -M -m es.migrations-cli [migrate|rollback|status]"))
-        (*exit-fn* 1)))))
+        "status"
+        (status! ds opts)))))
