@@ -29,11 +29,14 @@
 
 (defn- with-system [f]
   (let [system (component/start (bank-components/dev-full-system))]
-    (try
-      (binding [*system* system]
-        (f))
-      (finally
-        (component/stop system)))))
+    (binding [*system* system]
+      (try
+        (f)
+        (finally
+          ;; Stop the current *system*, not the original `system` — with-clean-dbs
+          ;; may have restarted individual components via set!, so the live workers
+          ;; are in *system*, not the original let-bound map.
+          (component/stop *system*))))))
 
 (defn- reset-dbs! []
   (jdbc/with-transaction [tx (event-store-ds)]
@@ -47,8 +50,19 @@
                          RESTART IDENTITY"])))
 
 (defn- with-clean-dbs [f]
-  (reset-dbs!)
-  (f))
+  ;; Stop background workers before DB reset to prevent deadlocks
+  ;; and cross-test interference from live pollers/projectors.
+  (let [worker-keys [:transfer-projector :account-projector :outbox-poller]]
+    (doseq [k worker-keys]
+      (component/stop (get *system* k)))
+    (reset-dbs!)
+    ;; Restart in dependency order (outbox first, then projectors)
+    (set! *system*
+          (reduce (fn [sys k]
+                    (assoc sys k (component/start (get sys k))))
+                  *system*
+                  (reverse worker-keys)))
+    (f)))
 
 (use-fixtures :once with-system)
 (use-fixtures :each with-clean-dbs)
@@ -146,8 +160,10 @@
                     :idempotency-key "dep-to-100"
                     :data            {:amount 100}})
 
-  ;; Execute transfer (uses the event store DS directly for saga)
-  (saga/execute! (event-store-ds) "tx-async-1" "acct-from" "acct-to" 75)
+  ;; Execute transfer — pass outbox hook so saga events flow through
+  ;; the async pipeline (outbox → RabbitMQ → projectors)
+  (saga/execute! (event-store-ds) "tx-async-1" "acct-from" "acct-to" 75
+                 :on-events-appended outbox-hook)
 
   ;; Wait for projections
   (let [from-balance (wait-for-balance "acct-from" 425)
@@ -158,7 +174,7 @@
   ;; Transfer status should also be projected — wait for completed status
   (let [deadline (+ (System/currentTimeMillis) 10000)
         transfer (loop []
-                   (let [t (transfer-projection/get-transfer (read-db-ds) "transfer-tx-async-1")]
+                   (let [t (transfer-projection/get-transfer (read-db-ds) "tx-async-1")]
                      (if (and t (= "completed" (:status t)))
                        t
                        (if (> (System/currentTimeMillis) deadline)

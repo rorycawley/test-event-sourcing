@@ -2,4 +2,5 @@
 java = "21"
 node = "22"
 babashka = "1.12.214"
-clj-kondo = "latest"
+clj-kondo = "2026.01.12"
+"npm:cljfmt" = "0.16.1"

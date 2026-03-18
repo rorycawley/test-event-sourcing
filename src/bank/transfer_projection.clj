@@ -14,12 +14,13 @@
   "Updates a transfer_status row to a new status, optionally setting
    failure_reason. Validates the event, executes the UPDATE, and
    asserts exactly one row was changed."
-  [tx {:keys [global-sequence stream-id] :as event}
+  [tx event
    {:keys [ensure-single-row-updated!]}
    status
    & {:keys [failure-reason]}]
-  (transfer/validate-event! event)
-  (let [result
+  (let [{:keys [global-sequence stream-id]} (transfer/validate-event! event)
+        transfer-id (transfer/logical-transfer-id stream-id)
+        result
         (if failure-reason
           (jdbc/execute-one! tx
                              ["UPDATE transfer_status
@@ -30,7 +31,7 @@
                                 WHERE transfer_id = ?
                                   AND last_global_sequence < ?"
                               status failure-reason
-                              global-sequence stream-id global-sequence])
+                              global-sequence transfer-id global-sequence])
           (jdbc/execute-one! tx
                              ["UPDATE transfer_status
                                   SET status = ?,
@@ -39,7 +40,7 @@
                                 WHERE transfer_id = ?
                                   AND last_global_sequence < ?"
                               status
-                              global-sequence stream-id global-sequence]))]
+                              global-sequence transfer-id global-sequence]))]
     (ensure-single-row-updated! result event)))
 
 ;; ——— Handler specs ———
@@ -47,9 +48,10 @@
 (def handler-specs
   "Data-driven handler map: {event-type -> (fn [tx event context])}."
   {"transfer-initiated"
-   (fn [tx {:keys [global-sequence stream-id] :as event} _context]
-     (transfer/validate-event! event)
-     (let [{:keys [from-account to-account amount]} (:payload event)]
+   (fn [tx event _context]
+     (let [{:keys [global-sequence stream-id payload]} (transfer/validate-event! event)
+           {:keys [from-account to-account amount]} payload
+           transfer-id (transfer/logical-transfer-id stream-id)]
        (jdbc/execute-one! tx
                           ["INSERT INTO transfer_status
                            (transfer_id, from_account, to_account, amount,
@@ -59,7 +61,7 @@
                            SET last_global_sequence = GREATEST(
                                  transfer_status.last_global_sequence,
                                  EXCLUDED.last_global_sequence)"
-                           stream-id from-account to-account amount
+                           transfer-id from-account to-account amount
                            global-sequence])))
 
    "debit-recorded"
@@ -70,14 +72,19 @@
    (fn [tx event context]
      (update-transfer-status! tx event context "credited"))
 
+   "compensation-recorded"
+   (fn [tx event context]
+     (update-transfer-status! tx event context "compensating"))
+
    "transfer-completed"
    (fn [tx event context]
      (update-transfer-status! tx event context "completed"))
 
    "transfer-failed"
    (fn [tx event context]
-     (update-transfer-status! tx event context "failed"
-                              :failure-reason (get-in event [:payload :reason])))})
+     (let [validated (transfer/validate-event! event)]
+       (update-transfer-status! tx validated context "failed"
+                                :failure-reason (get-in validated [:payload :reason]))))})
 
 ;; ——— Query ———
 

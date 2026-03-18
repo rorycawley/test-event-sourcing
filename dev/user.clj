@@ -51,7 +51,7 @@
 ;; Step 1 — Start a throwaway Postgres
 ;; ═══════════════════════════════════════════════════
 ;;
-;; This pulls paradedb/paradedb:latest via Testcontainers.
+;; This pulls a ParadeDB image via Testcontainers (pinned in es.infra).
 ;; Takes ~5-10 s on first run (Docker image pull).
 
 (comment
@@ -268,8 +268,8 @@
   ;;     "credit-recorded" "transfer-completed"]
 
   ;; View projected transfer status:
-  (transfer-projection/get-transfer ds "transfer-tx-001")
-  ;; => {:transfer-id "transfer-tx-001", :status "completed", ...}
+  (transfer-projection/get-transfer ds "tx-001")
+  ;; => {:transfer-id "tx-001", :status "completed", ...}
 
   ;; 9b. Transfer with insufficient funds fails gracefully:
   (saga/execute! ds "tx-002" "account-42" "account-99" 9999)
@@ -457,15 +457,15 @@
                                :data            {:amount 200}}
                               :on-events-appended outbox-hook)
 
-  (saga/execute! event-ds "tx-001" "account-1" "account-2" 30)
-  ;; Saga events are picked up by catch-up timer (no outbox hook).
+  (saga/execute! event-ds "tx-001" "account-1" "account-2" 30
+                 :on-events-appended outbox-hook)
 
-  ;; After a few seconds:
+  ;; Wait a moment for projectors:
   (account-projection/get-balance read-ds "account-1")
   ;; => {:balance 70, ...}
   (account-projection/get-balance read-ds "account-2")
   ;; => {:balance 230, ...}
-  (transfer-projection/get-transfer read-ds "transfer-tx-001")
+  (transfer-projection/get-transfer read-ds "tx-001")
   ;; => {:status "completed", ...}
 
   ;; ── Stop the system ────────────────────────────

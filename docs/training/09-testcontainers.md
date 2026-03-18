@@ -181,7 +181,7 @@ For testing the async pipeline, the project starts multiple containers:
 This project uses [ParadeDB](https://www.paradedb.com/) instead of vanilla PostgreSQL. ParadeDB is PostgreSQL with the `pg_search` extension for BM25 full-text search:
 
 ```clojure
-(def ^:const default-postgres-image "paradedb/paradedb:latest")
+(def ^:const default-postgres-image "paradedb/paradedb:v0.21.12")
 ```
 
 The `.asCompatibleSubstituteFor "postgres"` call tells Testcontainers to treat it like a standard PostgreSQL container (same port, same protocol).

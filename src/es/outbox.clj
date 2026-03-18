@@ -51,7 +51,13 @@
    on row N, rows 1..N-1 are already committed (not rolled back).
    This avoids re-publishing events that were already sent to RabbitMQ.
 
-   Uses FOR UPDATE SKIP LOCKED so multiple pollers can run safely.
+   The SELECT uses FOR UPDATE SKIP LOCKED to avoid contention between
+   concurrent pollers. However, publish happens after the SELECT
+   transaction releases its locks, so a second poller can select and
+   publish the same row before the first poller's UPDATE runs. The
+   UPDATE's published_at IS NULL guard prevents double-marking but
+   not double-publishing. Consumers must be idempotent.
+
    Returns the count of events published."
   [ds publish-fn batch-size]
   (let [rows (jdbc/with-transaction [tx ds]
@@ -66,24 +72,36 @@
                                 LIMIT ?
                                 FOR UPDATE OF o SKIP LOCKED"
                                batch-size]
-                              {:builder-fn rs/as-unqualified-kebab-maps}))]
-    ;; Process each row in its own transaction so that a failure on row N
-    ;; doesn't roll back the already-published rows 1..N-1.
-    (doseq [row rows]
-      (let [payload (store/<-pgobject (:payload row))
-            message (json/write-str
-                     {:global-sequence (:global-sequence row)
-                      :stream-id       (:stream-id row)
-                      :event-type      (:event-type row)
-                      :event-version   (:event-version row)
-                      :payload         payload})]
-        (publish-fn message)
-        (jdbc/execute-one! ds
-                           ["UPDATE event_outbox
-                             SET published_at = NOW()
-                             WHERE id = ?"
-                            (:id row)])))
-    (count rows)))
+                              {:builder-fn rs/as-unqualified-kebab-maps}))
+        ;; Publish outside the SELECT transaction, then mark each row
+        ;; in its own transaction so that a failure on row N doesn't
+        ;; roll back the already-published rows 1..N-1.
+        ;; Each mark transaction uses a published_at IS NULL guard
+        ;; so that if two pollers select the same row, the second
+        ;; poller's UPDATE is a no-op. Note: the publish above can
+        ;; still produce duplicates — consumers must be idempotent.
+        published
+        (reduce
+         (fn [acc row]
+           (let [payload (store/<-pgobject (:payload row))
+                 message (json/write-str
+                          {:global-sequence (:global-sequence row)
+                           :stream-id       (:stream-id row)
+                           :event-type      (:event-type row)
+                           :event-version   (:event-version row)
+                           :payload         payload})]
+             (publish-fn message)
+             (jdbc/with-transaction [tx ds]
+               (jdbc/execute-one! tx
+                                  ["UPDATE event_outbox
+                                    SET published_at = NOW()
+                                    WHERE id = ?
+                                      AND published_at IS NULL"
+                                   (:id row)]))
+             (inc acc)))
+         0
+         rows)]
+    published))
 
 ;; ——— Poller loop ———
 

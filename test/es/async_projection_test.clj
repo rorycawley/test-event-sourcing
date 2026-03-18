@@ -188,8 +188,9 @@
   (let [e (try (async-proj/process-new-events! *event-store-ds* *read-db-ds* counter-config) nil
                (catch clojure.lang.ExceptionInfo ex ex))]
     (is (some? e))
-    (is (= "Unknown event type for projection" (.getMessage e)))
-    (is (= "counter-async" (:projection-name (ex-data e)))))
+    (is (true? (:handler-error (ex-data e))))
+    (is (= "counter-async" (:projection-name (ex-data e))))
+    (is (= "Unknown event type for projection" (.getMessage (ex-cause e)))))
   (is (= 0 (checkpoint))))
 
 (deftest process-new-events-respects-batch-size
@@ -236,13 +237,17 @@
     (is (= 0 (checkpoint))
         "Checkpoint should not advance past the poison event")
 
-    ;; Now skip the poison event explicitly using the two-step API:
-    ;; skip-poison-event! returns a function that takes event-store-ds
-    (let [failed-checkpoint (checkpoint)
-          skip-fn (#'async-proj/skip-poison-event!
-                   *read-db-ds* "counter-async" failed-checkpoint
-                   (fn [evt] (swap! poison-events conj evt)))]
-      (is (true? (skip-fn *event-store-ds*))))
+    ;; Extract the failing global_sequence from the exception
+    (let [failing-gs (-> @errors first ex-data :global-sequence)]
+      (is (some? failing-gs) "Exception should carry :global-sequence")
+      (is (:handler-error (ex-data (first @errors)))
+          "Exception should carry :handler-error flag")
+
+      ;; Skip the poison event using the new API
+      (is (true? (#'async-proj/skip-poison-event!
+                  *event-store-ds* *read-db-ds* counter-config
+                  failing-gs
+                  (fn [evt] (swap! poison-events conj evt))))))
     (is (= 1 (count @poison-events))
         "on-poison callback should have been called")
     (is (= 1 (checkpoint))
@@ -251,6 +256,72 @@
     ;; Now catch-up should process the remaining valid events
     (is (= 2 (do-catch-up!)))
     (is (= 42 (:count (get-counter *read-db-ds* "c-good-after-poison"))))))
+
+(deftest poison-event-in-middle-of-batch-skips-only-poison
+  ;; Good event, then poison, then good event — all in one batch.
+  ;; Verifies that skip-poison-event! processes the good event before
+  ;; the poison, skips only the poison, and leaves the later event for
+  ;; normal catch-up.
+  (append-counter-events! "c-mid-1"
+                          [{:event-type "counter-created" :payload {}}])
+  (append-counter-events! "c-mid-poison"
+                          [{:event-type "totally-unknown" :payload {}}])
+  (append-counter-events! "c-mid-2"
+                          [{:event-type "counter-created" :payload {}}
+                           {:event-type "counter-incremented" :payload {:delta 7}}])
+
+  ;; Attempt catch-up — should fail on the poison event (gs=2)
+  (let [e (try (async-proj/process-new-events! *event-store-ds* *read-db-ds*
+                                               counter-config)
+               nil
+               (catch Exception ex ex))
+        failing-gs (-> e ex-data :global-sequence)]
+    (is (some? e) "Should throw on poison event")
+    (is (= 2 failing-gs) "Poison event should be the second event (gs=2)")
+    (is (= 0 (checkpoint)) "Transaction should have rolled back")
+
+    ;; skip-poison-event! should process good event before poison, then skip
+    (let [skipped (atom [])]
+      (is (true? (#'async-proj/skip-poison-event!
+                  *event-store-ds* *read-db-ds* counter-config
+                  failing-gs
+                  (fn [evt] (swap! skipped conj evt)))))
+      (is (= 1 (count @skipped)))
+      (is (= failing-gs (:global-sequence (first @skipped)))))
+
+    ;; Good event before poison should have been processed
+    (is (some? (get-counter *read-db-ds* "c-mid-1"))
+        "First good event should be projected")
+    (is (= 0 (:count (get-counter *read-db-ds* "c-mid-1")))
+        "Counter c-mid-1 should exist with count 0")
+
+    ;; Checkpoint should be at the poison event (skipped past it)
+    (is (= 2 (checkpoint)))
+
+    ;; Process remaining events
+    (is (= 2 (async-proj/process-new-events! *event-store-ds* *read-db-ds*
+                                             counter-config)))
+    (is (= 7 (:count (get-counter *read-db-ds* "c-mid-2"))))))
+
+(deftest handler-failure-carries-event-identity
+  ;; Verify that handler failures include :handler-error and :global-sequence
+  ;; so the consumer can distinguish them from infrastructure errors.
+  ;; Infrastructure errors (connection failures, etc.) will not carry
+  ;; :handler-error, preventing them from triggering poison-event skipping.
+  (append-counter-events! "c-handler-id"
+                          [{:event-type "counter-created" :payload {}}
+                           {:event-type "totally-unknown" :payload {}}])
+  (let [e (try (async-proj/process-new-events! *event-store-ds* *read-db-ds*
+                                               counter-config)
+               nil
+               (catch Exception ex ex))]
+    (is (some? e))
+    (is (true? (:handler-error (ex-data e)))
+        "Handler failures must carry :handler-error flag")
+    (is (= 2 (:global-sequence (ex-data e)))
+        "Handler failures must carry :global-sequence of the failing event")
+    (is (= "totally-unknown" (:event-type (ex-data e)))
+        "Handler failures must carry :event-type of the failing event")))
 
 (deftest event-store-and-read-db-are-independent
   ;; Verify the read DB doesn't have the events table

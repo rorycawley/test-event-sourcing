@@ -7,19 +7,26 @@ This project uses Migratus for all schema evolution.
 1. Every schema change must be a new file in `resources/migrations/`.
 2. Do not edit previously applied migration files on shared branches.
 3. Do not add ad-hoc DDL in application code paths.
+   **Exception:** BM25 search indexes (via `es.search/ensure-search!`) are created
+   at startup rather than in migrations because the Tantivy-backed index has
+   different lifecycle concerns than schema DDL (e.g. must be rebuilt after
+   TRUNCATE). Migrations handle the schema (columns); `es.search` handles the
+   search index.
 4. Prefer forward-only fixes: add a new migration instead of rewriting old ones.
 
 ## File Naming
 
-Use timestamped names:
+Use numeric prefixes (matching the existing convention in `resources/migrations/`):
 
-`YYYYMMDDHHMMSS-description.up.sql`  
-`YYYYMMDDHHMMSS-description.down.sql`
+`NNN-description.up.sql`
+`NNN-description.down.sql`
 
 Example:
 
-`20260316233000-create-core-tables.up.sql`  
-`20260316233000-create-core-tables.down.sql`
+`001-schema.up.sql`
+`001-schema.down.sql`
+`002-add-audit-columns.up.sql`
+`002-add-audit-columns.down.sql`
 
 ## Running Migrations
 

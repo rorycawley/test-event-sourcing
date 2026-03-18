@@ -20,10 +20,14 @@
   "Attempts a command via a decider with retry, returning :ok/:idempotent
    on success or {:error true :reason \"...\"} on domain rejection.
    Infrastructure errors (DB down, connection lost) propagate — they
-   should not be confused with domain rejections."
-  [ds decider command]
+   should not be confused with domain rejections.
+
+   opts:
+     :on-events-appended — hook called after events are written (e.g. outbox)"
+  [ds decider command & {:keys [on-events-appended]}]
   (try
-    (decider/handle-with-retry! ds decider command)
+    (decider/handle-with-retry! ds decider command
+                                :on-events-appended on-events-appended)
     (catch clojure.lang.ExceptionInfo e
       (if (domain-error? e)
         {:error  true
@@ -33,10 +37,12 @@
 (defn run-loop
   "Drives a saga state machine to completion.
 
-   step-handlers is a map of {status-keyword -> (fn [context] result)}
+   step-handlers is a map of {status-keyword -> (fn [state context] result)}
    where result is either:
      {:status :completed/:failed ...}  — terminal, loop ends
-     {:next-status :some-status}       — advance the loop
+     {:next-status :some-status ...}   — advance the loop; the entire result
+                                         map becomes the new state, so handlers
+                                         can thread evolving data through the loop
 
    terminal-statuses is a set of status keywords that end the loop
    immediately (e.g. #{:completed :failed}).
@@ -52,9 +58,9 @@
         (= :failed status)    {:status :failed :reason (:failure-reason state)}
         :else                 {:status status})
       (if-let [handler (get step-handlers status)]
-        (let [result (handler context)]
+        (let [result (handler state context)]
           (if (:next-status result)
-            (recur (:next-status result) state)
+            (recur (:next-status result) (merge state result))
             result))
         (throw (ex-info "No handler for saga status"
                         {:status status

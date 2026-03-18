@@ -2,15 +2,17 @@
   "Fund transfer domain — the transfer Decider (Chassaing).
 
    Commands (intent):  :initiate-transfer, :record-debit, :record-credit,
-                       :complete-transfer, :fail-transfer
+                       :complete-transfer, :record-compensation, :fail-transfer
    Events (facts):     transfer-initiated, debit-recorded, credit-recorded,
-                       transfer-completed, transfer-failed
+                       transfer-completed, compensation-recorded, transfer-failed
    State (truth):      {:status :not-found|:initiated|:debited|:credited|
-                                :completed|:failed, ...}
+                                :compensating|:completed|:failed, ...}
 
    Models a transfer between two accounts as its own aggregate
    with a state machine: not-found → initiated → debited → credited
    → completed (or → failed from any non-terminal state).
+   When a credit fails after debit, the transfer enters :compensating
+   before the refund, preventing resume from crediting the destination.
 
    This is a saga/process manager expressed as a Decider. The transfer
    stream tracks progress; actual balance changes happen on the account
@@ -40,6 +42,10 @@
    [:account-id schema/non-empty-string]
    [:amount pos-int?]])
 
+(def ^:private record-compensation-data-schema
+  [:map
+   [:reason schema/non-empty-string]])
+
 (def ^:private complete-data-schema
   [:map])
 
@@ -48,37 +54,41 @@
    [:reason schema/non-empty-string]])
 
 (def ^:private command-data-specs
-  {:initiate-transfer  initiate-data-schema
-   :record-debit       record-debit-data-schema
-   :record-credit      record-credit-data-schema
-   :complete-transfer  complete-data-schema
-   :fail-transfer      fail-data-schema})
+  {:initiate-transfer    initiate-data-schema
+   :record-debit         record-debit-data-schema
+   :record-credit        record-credit-data-schema
+   :complete-transfer    complete-data-schema
+   :record-compensation  record-compensation-data-schema
+   :fail-transfer        fail-data-schema})
 
 ;; ═══════════════════════════════════════════════════
 ;; Event schemas (all v1)
 ;; ═══════════════════════════════════════════════════
 
 (def ^:private latest-event-version
-  {"transfer-initiated" 1
-   "debit-recorded"     1
-   "credit-recorded"    1
-   "transfer-completed" 1
-   "transfer-failed"    1})
+  {"transfer-initiated"    1
+   "debit-recorded"        1
+   "credit-recorded"       1
+   "transfer-completed"    1
+   "compensation-recorded" 1
+   "transfer-failed"       1})
 
 (def ^:private event-schemas
-  {["transfer-initiated" 1] [:map
-                             [:from-account schema/non-empty-string]
-                             [:to-account schema/non-empty-string]
-                             [:amount pos-int?]]
-   ["debit-recorded" 1]     [:map
-                             [:account-id schema/non-empty-string]
-                             [:amount pos-int?]]
-   ["credit-recorded" 1]    [:map
-                             [:account-id schema/non-empty-string]
-                             [:amount pos-int?]]
-   ["transfer-completed" 1] [:map]
-   ["transfer-failed" 1]    [:map
-                             [:reason schema/non-empty-string]]})
+  {["transfer-initiated" 1]    [:map
+                                [:from-account schema/non-empty-string]
+                                [:to-account schema/non-empty-string]
+                                [:amount pos-int?]]
+   ["debit-recorded" 1]        [:map
+                                [:account-id schema/non-empty-string]
+                                [:amount pos-int?]]
+   ["credit-recorded" 1]       [:map
+                                [:account-id schema/non-empty-string]
+                                [:amount pos-int?]]
+   ["transfer-completed" 1]    [:map]
+   ["compensation-recorded" 1] [:map
+                                [:reason schema/non-empty-string]]
+   ["transfer-failed" 1]       [:map
+                                [:reason schema/non-empty-string]]})
 
 ;; ═══════════════════════════════════════════════════
 ;; Kit-derived functions
@@ -97,6 +107,28 @@
 (def ^:private mk-event (kit/make-event-factory latest-event-version validate-event!))
 
 ;; ═══════════════════════════════════════════════════
+;; Stream naming
+;; ═══════════════════════════════════════════════════
+
+(def stream-prefix
+  "Prefix applied to logical transfer IDs to form stream IDs."
+  "transfer-")
+
+(defn transfer-stream-id
+  "Converts a logical transfer-id to its stream-id."
+  [transfer-id]
+  (str stream-prefix transfer-id))
+
+(defn logical-transfer-id
+  "Extracts the logical transfer-id from a stream-id by stripping
+   the stream prefix. Returns the stream-id unchanged if it does
+   not carry the prefix."
+  [stream-id]
+  (if (.startsWith ^String stream-id stream-prefix)
+    (subs stream-id (count stream-prefix))
+    stream-id))
+
+;; ═══════════════════════════════════════════════════
 ;; Evolve — State → Event → State
 ;; ═══════════════════════════════════════════════════
 
@@ -110,12 +142,15 @@
                                   :from-account (:from-account payload)
                                   :to-account   (:to-account payload)
                                   :amount       (:amount payload))
-      "debit-recorded"     (assoc state :status :debited)
-      "credit-recorded"    (assoc state :status :credited)
-      "transfer-completed" (assoc state :status :completed)
-      "transfer-failed"    (assoc state
-                                  :status :failed
-                                  :failure-reason (:reason payload))
+      "debit-recorded"        (assoc state :status :debited)
+      "credit-recorded"       (assoc state :status :credited)
+      "transfer-completed"    (assoc state :status :completed)
+      "compensation-recorded" (assoc state
+                                     :status :compensating
+                                     :compensation-reason (:reason payload))
+      "transfer-failed"       (assoc state
+                                     :status :failed
+                                     :failure-reason (:reason payload))
       state)))
 
 ;; ═══════════════════════════════════════════════════
@@ -175,6 +210,14 @@
                      :actual     (:status state)})))
   [(mk-event "transfer-completed" {})])
 
+(defn- decide-record-compensation [state {:keys [reason]}]
+  (when-not (= :debited (:status state))
+    (throw (ex-info "Transfer not in debited state"
+                    {:error/type :domain/invalid-transfer-state
+                     :expected   :debited
+                     :actual     (:status state)})))
+  [(mk-event "compensation-recorded" {:reason reason})])
+
 (defn- decide-fail [state {:keys [reason]}]
   (when (contains? #{:completed :failed} (:status state))
     (throw (ex-info "Transfer already terminal"
@@ -186,11 +229,12 @@
   [(mk-event "transfer-failed" {:reason reason})])
 
 (def ^:private decisions
-  {:initiate-transfer  decide-initiate
-   :record-debit       decide-record-debit
-   :record-credit      decide-record-credit
-   :complete-transfer  decide-complete
-   :fail-transfer      decide-fail})
+  {:initiate-transfer    decide-initiate
+   :record-debit         decide-record-debit
+   :record-credit        decide-record-credit
+   :complete-transfer    decide-complete
+   :record-compensation  decide-record-compensation
+   :fail-transfer        decide-fail})
 
 (def decide
   "Command → State → Event list."

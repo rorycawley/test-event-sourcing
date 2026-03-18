@@ -39,16 +39,16 @@
 ;; ═══════════════════════════════════════════════════
 
 (deftest try-command-returns-ok-on-success
-  (with-redefs [es.decider/handle-with-retry! (fn [_ _ _] :ok)]
+  (with-redefs [es.decider/handle-with-retry! (fn [_ _ _ & _] :ok)]
     (is (= :ok (saga/try-command! :ds :decider :command)))))
 
 (deftest try-command-returns-idempotent-on-replay
-  (with-redefs [es.decider/handle-with-retry! (fn [_ _ _] :idempotent)]
+  (with-redefs [es.decider/handle-with-retry! (fn [_ _ _ & _] :idempotent)]
     (is (= :idempotent (saga/try-command! :ds :decider :command)))))
 
 (deftest try-command-catches-domain-error-and-returns-error-map
   (with-redefs [es.decider/handle-with-retry!
-                (fn [_ _ _]
+                (fn [_ _ _ & _]
                   (throw (ex-info "Insufficient funds"
                                   {:error/type :domain/insufficient-funds})))]
     (let [result (saga/try-command! :ds :decider :command)]
@@ -57,13 +57,24 @@
 
 (deftest try-command-propagates-infrastructure-errors
   (with-redefs [es.decider/handle-with-retry!
-                (fn [_ _ _]
+                (fn [_ _ _ & _]
                   (throw (ex-info "DB down"
                                   {:error/type :infra/connection-lost})))]
     (let [e (try (saga/try-command! :ds :decider :command) nil
                  (catch clojure.lang.ExceptionInfo ex ex))]
       (is (some? e))
       (is (= "DB down" (.getMessage e))))))
+
+(deftest try-command-passes-on-events-appended-hook
+  (let [captured (atom nil)]
+    (with-redefs [es.decider/handle-with-retry!
+                  (fn [_ _ _ & {:keys [on-events-appended]}]
+                    (reset! captured on-events-appended)
+                    :ok)]
+      (let [hook (fn [_ _] :hook-called)]
+        (saga/try-command! :ds :decider :command
+                           :on-events-appended hook)
+        (is (= hook @captured))))))
 
 ;; ═══════════════════════════════════════════════════
 ;; run-loop
@@ -87,13 +98,13 @@
 (deftest run-loop-executes-steps-until-terminal
   (let [steps (atom [])
         step-handlers
-        {:initiated (fn [_ctx]
+        {:initiated (fn [_state _ctx]
                       (swap! steps conj :initiated)
                       {:next-status :debited})
-         :debited   (fn [_ctx]
+         :debited   (fn [_state _ctx]
                       (swap! steps conj :debited)
                       {:next-status :completed})
-         :completed (fn [_] (throw (ex-info "should not be called" {})))}
+         :completed (fn [_ _] (throw (ex-info "should not be called" {})))}
         result (saga/run-loop step-handlers #{:completed :failed}
                               {:status :initiated} {:ds :test})]
     (is (= {:status :completed} result))
@@ -101,7 +112,7 @@
 
 (deftest run-loop-stops-on-direct-result
   (let [result (saga/run-loop
-                {:initiated (fn [_]
+                {:initiated (fn [_state _]
                               {:status :failed :reason "nope"})}
                 #{:completed :failed}
                 {:status :initiated} {})]
@@ -117,12 +128,25 @@
     (is (= "No handler for saga status" (.getMessage e)))
     (is (= :processing (:status (ex-data e))))))
 
-(deftest run-loop-passes-context-to-handlers
-  (let [received (atom nil)
+(deftest run-loop-passes-state-and-context-to-handlers
+  (let [received-state (atom nil)
+        received-ctx   (atom nil)
         step-handlers
-        {:active (fn [ctx]
-                   (reset! received ctx)
+        {:active (fn [state ctx]
+                   (reset! received-state state)
+                   (reset! received-ctx ctx)
                    {:next-status :completed})}]
     (saga/run-loop step-handlers #{:completed}
-                   {:status :active} {:ds :my-ds :extra "info"})
-    (is (= {:ds :my-ds :extra "info"} @received))))
+                   {:status :active :data 42} {:ds :my-ds :extra "info"})
+    (is (= {:status :active :data 42} @received-state))
+    (is (= {:ds :my-ds :extra "info"} @received-ctx))))
+
+(deftest run-loop-threads-state-through-steps
+  (let [step-handlers
+        {:step-a (fn [state _ctx]
+                   {:next-status :step-b :counter (inc (:counter state))})
+         :step-b (fn [state _ctx]
+                   {:next-status :completed :counter (inc (:counter state))})}
+        result (saga/run-loop step-handlers #{:completed}
+                              {:status :step-a :counter 0} {})]
+    (is (= {:status :completed} result))))

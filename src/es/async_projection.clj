@@ -26,14 +26,18 @@
    ─────────────────────
    If a projection handler throws on a specific event, repeated catch-ups
    would be stuck at that event forever. To prevent this:
-   - Consecutive failures are tracked per projector
-   - After :max-consecutive-failures (default 5), the poison event is
-     skipped and the checkpoint advances past it
+   - Handler failures are annotated with the failing event's global_sequence
+   - Consecutive failures are only counted when the same event fails
+   - Infrastructure failures (DB outages, connection errors) do NOT count
+     toward the poison threshold — only handler-specific errors do
+   - After :max-consecutive-failures (default 5), skip-poison-event!
+     processes any valid events before the poison, then skips the poison
    - Skipped events are logged via :on-poison for alerting/investigation
    - A full rebuild! will replay all events including previously skipped ones"
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [es.store :as store]
+            [es.projection-kit :as kit]
             [es.rabbitmq :as rabbitmq]))
 
 ;; ——— Two-datasource projection ———
@@ -87,16 +91,7 @@
    tx
    event
    {:projection-name            projection-name
-    :ensure-single-row-updated!
-    (fn [result evt]
-      (let [rows (or (:next.jdbc/update-count result)
-                     (:update-count result)
-                     0)]
-        (when (not= 1 rows)
-          (throw (ex-info "Projection invariant violation: expected single-row update"
-                          {:projection-name projection-name
-                           :update-count    rows
-                           :event           evt})))))}))
+    :ensure-single-row-updated! (partial kit/ensure-single-row-updated! projection-name)}))
 
 (defn- advance-checkpoint!
   "Advances the checkpoint for a projection to the given global sequence."
@@ -141,28 +136,55 @@
           new-events (read-new-events event-store-ds checkpoint batch-size)]
       (when (seq new-events)
         (doseq [event new-events]
-          (project-event! tx event config))
+          (try
+            (project-event! tx event config)
+            (catch Throwable t
+              (throw (ex-info (str "Projection handler failed on event "
+                                   (:global-sequence event))
+                              {:global-sequence (:global-sequence event)
+                               :event-type      (:event-type event)
+                               :projection-name projection-name
+                               :handler-error   true}
+                              t)))))
         (advance-checkpoint! tx projection-name
                              (:global-sequence (peek new-events))))
       (count new-events))))
 
 (defn- skip-poison-event!
-  "Advances the checkpoint past a poison event that cannot be projected.
-   Called after max-consecutive-failures is reached.
-   Uses the checkpoint value from the failed attempt to avoid re-reading
-   stale data."
-  [read-db-ds projection-name failed-checkpoint on-poison]
-  ;; Read the poison event (the one right after the failed checkpoint)
-  ;; and skip it by advancing the checkpoint.
-  (fn [event-store-ds]
-    (let [poison (first (read-new-events event-store-ds failed-checkpoint 1))]
-      (when poison
-        (on-poison poison)
-        (jdbc/with-transaction [tx read-db-ds]
-          (acquire-projection-lock! tx projection-name)
-          (advance-checkpoint! tx projection-name
-                               (:global-sequence poison)))
-        true))))
+  "Processes valid events before the poison event one-by-one, then
+   advances the checkpoint past the poison event. This ensures earlier
+   events in the same batch are not lost when a later event is poison.
+
+   Returns true if the poison event was found and skipped, false if
+   the poison event was not found (e.g., already processed)."
+  [event-store-ds read-db-ds {:keys [projection-name] :as config}
+   poison-global-sequence on-poison]
+  (loop []
+    (let [result
+          (jdbc/with-transaction [tx read-db-ds]
+            (acquire-projection-lock! tx projection-name)
+            (let [checkpoint (read-checkpoint tx projection-name)
+                  next-event (first (read-new-events event-store-ds checkpoint 1))]
+              (cond
+                (nil? next-event)
+                :not-found
+
+                (= (:global-sequence next-event) poison-global-sequence)
+                (do
+                  (on-poison next-event)
+                  (advance-checkpoint! tx projection-name poison-global-sequence)
+                  :skipped)
+
+                :else
+                (do
+                  (project-event! tx next-event config)
+                  (advance-checkpoint! tx projection-name
+                                       (:global-sequence next-event))
+                  :continue))))]
+      (case result
+        :skipped   true
+        :not-found false
+        :continue  (recur)))))
 
 (defn rebuild!
   "Destroys and rebuilds the read model from the complete event stream.
@@ -177,6 +199,7 @@
   (jdbc/with-transaction [tx read-db-ds]
     (acquire-projection-lock! tx projection-name)
     (doseq [table read-model-tables]
+      (kit/validate-identifier! table "read-model-table")
       (jdbc/execute-one! tx [(str "DELETE FROM " table)]))
     (jdbc/execute-one! tx
                        ["DELETE FROM projection_checkpoints
@@ -204,7 +227,8 @@
    opts:
      :catch-up-interval-ms     — periodic catch-up timer interval (default 30000)
      :max-consecutive-failures — skip poison event after this many failures (default 5)
-     :batch-size               — max events per catch-up cycle (default 1000)
+     :batch-size               — max events per batch (default 1000); each
+                                  catch-up drains all pending batches
      :on-error                 — error handler (fn [exception])
      :on-poison                — poison event handler (fn [event])
 
@@ -226,9 +250,9 @@
   (let [running           (atom true)
         catching-up?      (atom false)
         consecutive-fails (atom 0)
-        ;; Track the checkpoint at which the last failure occurred,
-        ;; so poison-skip doesn't need to re-read it (avoiding races).
-        last-failed-checkpoint (atom nil)
+        ;; Track the global_sequence of the event whose handler failed,
+        ;; so poison-skip targets the right event (not earlier ones in the batch).
+        last-failed-global-sequence (atom nil)
 
         do-catch-up!
         (fn []
@@ -240,44 +264,62 @@
           ;; lock contention.
           (when (compare-and-set! catching-up? false true)
             (try
-              (let [n (process-new-events! event-store-ds read-db-ds config
-                                           :batch-size batch-size)]
-                (when (pos? n)
+              ;; Loop until all pending events are drained. A single
+              ;; process-new-events! call is capped at batch-size, so
+              ;; if the projector is far behind we must loop to catch up
+              ;; fully — otherwise recovery is limited to one batch per
+              ;; wake-up signal.
+              (let [total (loop [total 0]
+                            (let [n (process-new-events! event-store-ds read-db-ds config
+                                                         :batch-size batch-size)]
+                              (if (< n batch-size)
+                                (+ total n)
+                                (recur (+ total n)))))]
+                ;; Reset on any successful catch-up, not just when events
+                ;; were processed. An empty poll still proves the projection
+                ;; is healthy — prior transient failures should not accumulate
+                ;; across successful empty polls.
+                (when (pos? @consecutive-fails)
                   (reset! consecutive-fails 0)
-                  (reset! last-failed-checkpoint nil))
-                n)
+                  (reset! last-failed-global-sequence nil))
+                total)
               (catch Exception e
                 (on-error e)
-                ;; Capture the checkpoint at which we failed so poison-skip
-                ;; can use it without re-reading (which could be stale).
-                (let [checkpoint (read-checkpoint read-db-ds
-                                                  (:projection-name config))
-                      fails (swap! consecutive-fails inc)]
-                  (reset! last-failed-checkpoint checkpoint)
-                  (when (>= fails max-consecutive-failures)
-                    (try
-                      (let [skip-fn (skip-poison-event!
-                                     read-db-ds (:projection-name config)
-                                     checkpoint on-poison)]
-                        (when (skip-fn event-store-ds)
-                          (reset! consecutive-fails 0)
-                          (reset! last-failed-checkpoint nil)))
-                      (catch Exception skip-err
-                        (on-error skip-err)))))
+                ;; Only count toward poison threshold when a specific event's
+                ;; handler failed. Infrastructure failures (DB outages, etc.)
+                ;; should NOT advance the checkpoint or skip events.
+                (let [ed (ex-data e)
+                      failing-gs (:global-sequence ed)]
+                  (when (:handler-error ed)
+                    (let [fails (if (= failing-gs @last-failed-global-sequence)
+                                  (swap! consecutive-fails inc)
+                                  (do (reset! consecutive-fails 1)
+                                      (reset! last-failed-global-sequence failing-gs)
+                                      1))]
+                      (when (>= fails max-consecutive-failures)
+                        (try
+                          (when (skip-poison-event!
+                                 event-store-ds read-db-ds config
+                                 failing-gs on-poison)
+                            (reset! consecutive-fails 0)
+                            (reset! last-failed-global-sequence nil))
+                          (catch Exception skip-err
+                            (on-error skip-err)))))))
                 nil)
               (finally
                 (reset! catching-up? false)))))
 
         handler-fn
+        ;; Messages are wake-up signals, not event carriers. Failures
+        ;; are handled inside do-catch-up! (consecutive-failure tracking,
+        ;; poison-event skipping) and retried by the periodic catch-up
+        ;; timer. Always ACK so a failing projection doesn't cause a
+        ;; tight redelivery loop.
         (fn [ch' {:keys [delivery-tag]} ^bytes _payload]
           (try
             (do-catch-up!)
-            (rabbitmq/ack! ch' delivery-tag)
-            (catch Exception e
-              (on-error e)
-              (try
-                (rabbitmq/nack! ch' delivery-tag :requeue true)
-                (catch Exception _)))))
+            (finally
+              (rabbitmq/ack! ch' delivery-tag))))
 
         ;; Set prefetch to 1: process one message at a time.
         ;; Since messages are just "wake up" signals and each catch-up

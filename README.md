@@ -57,13 +57,13 @@ Separate databases for writes and reads. Events flow through a transactional out
                                    └────────────────────────────┘
 ```
 
-**Key design: notifications, not event carriers.** RabbitMQ messages are "wake up" signals — they tell projectors that new events exist, but don't carry event data. Each projector reads directly from the event store using its checkpoint. This means:
+**Key design: notifications, not event carriers.** RabbitMQ messages carry the event envelope (stream-id, event-type, global-sequence, payload) for observability and debugging, but projectors ignore the message content. Each projector reads directly from the event store using its checkpoint. This means:
 
 - **Lost messages are harmless** — periodic catch-up timer (every 30s) reads any events the projector missed
 - **Duplicate messages are harmless** — checkpoint-based idempotency skips already-processed events
 - **At-least-once delivery** without complex acknowledgment schemes
 
-**Transactional outbox pattern.** The outbox row is written in the same Postgres transaction as the events. The poller reads unpublished rows (`FOR UPDATE SKIP LOCKED` for safe concurrent polling) and publishes to RabbitMQ. If the process crashes between append and publish, the outbox row survives and the poller retries.
+**Transactional outbox pattern.** The outbox row is written in the same Postgres transaction as the events. The poller reads unpublished rows (`FOR UPDATE SKIP LOCKED` to reduce contention between pollers) and publishes to RabbitMQ. The UPDATE marks rows with a `published_at IS NULL` guard to handle the edge case where two pollers select the same row. Consumers must be idempotent. If the process crashes between append and publish, the outbox row survives and the poller retries.
 
 **Concurrency safety.** Each projector serialises catch-ups via `compare-and-set!` — if a RabbitMQ message and the catch-up timer fire simultaneously, only one catch-up runs. Channels use `prefetch=1` since each catch-up processes all pending events.
 
@@ -175,7 +175,7 @@ The transfer is its own Decider (`bank.transfer`) with a state machine: `not-fou
 
 **Crash recovery**: if the process dies mid-transfer, `resume!` reads the transfer stream, evolves to the current state, and picks up from the last completed step. Because every step is idempotent, resumption is always safe — money is never lost or duplicated.
 
-**Async note**: the saga does not use the outbox hook, so its events are picked up by the catch-up timer rather than RabbitMQ notifications. Transfer status projections may be delayed by up to the catch-up interval (default 30s, configurable).
+**Async note**: the saga accepts an optional `:on-events-appended` hook (e.g. the transactional outbox). When provided, every command in the saga — account debits/credits and transfer progress events — flows through the hook for real-time projection updates via the outbox → RabbitMQ pipeline. Without the hook, events are picked up by the projectors' catch-up timer (default 30s, configurable).
 
 ### Projections
 
@@ -428,7 +428,7 @@ Then evaluate the commented forms in `user.clj` step by step.
 ### Running Tests
 
 ```bash
-# All tests (196 tests, 529 assertions)
+# All tests (200 tests, 554 assertions)
 bb test
 
 # Fuzz/property-based tests only (filters by namespace pattern)
@@ -567,9 +567,9 @@ All DB-backed tests use Testcontainers (ParadeDB for PostgreSQL + BM25 search, R
 
 **Event versioning as a domain concern** -- Upcasters live in the domain layer alongside the schemas they transform. The store is version-agnostic; it stores whatever version it receives and passes `event_version` through on read.
 
-**Notifications over event-carrying messages** -- RabbitMQ messages signal "new events exist" rather than carrying event data. Projectors read directly from the event store, which means lost or duplicate messages are harmless. This avoids dual-write problems and keeps the event store as the single source of truth.
+**Notifications over event-carrying messages** -- RabbitMQ messages include the event envelope for observability, but projectors ignore the message content and read directly from the event store using their checkpoint. Lost or duplicate messages are harmless. This keeps the event store as the single source of truth.
 
-**Transactional outbox for reliable publishing** -- Outbox rows are written in the same transaction as events, guaranteeing at-least-once delivery. The poller uses `FOR UPDATE SKIP LOCKED` for safe concurrent polling.
+**Transactional outbox for reliable publishing** -- Outbox rows are written in the same transaction as events, guaranteeing at-least-once delivery. The poller uses `FOR UPDATE SKIP LOCKED` to reduce contention between pollers, with a `published_at IS NULL` guard on the UPDATE to handle edge-case duplicates. Consumers must be idempotent.
 
 **Serialised catch-ups** -- Concurrent catch-ups from RabbitMQ messages and the catch-up timer are serialised via `compare-and-set!`, preventing races where two threads try to process the same events. Channels use `prefetch=1` since each catch-up handles all pending events.
 

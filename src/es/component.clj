@@ -15,6 +15,7 @@
             [es.rabbitmq :as rabbitmq]
             [es.outbox :as outbox]
             [es.async-projection :as async-projection]
+            [es.search :as search]
             [next.jdbc :as jdbc]))
 
 ;; ——— Datasource ———
@@ -24,6 +25,14 @@
                        container datasource]
   component/Lifecycle
   (start [this]
+    (when-not (#{:testcontainers :jdbc-url} mode)
+      (throw (ex-info "Invalid Datasource :mode — must be :testcontainers or :jdbc-url"
+                      {:error/type :config/invalid-mode
+                       :mode       mode})))
+    (when (and (= :jdbc-url mode) (not jdbc-url))
+      (throw (ex-info "Datasource :jdbc-url mode requires a :jdbc-url value"
+                      {:error/type :config/missing-field
+                       :mode       mode})))
     (case mode
       :testcontainers
       (let [pg (infra/start-postgres! :image (or image infra/default-postgres-image))
@@ -81,6 +90,30 @@
   ([{:keys [migration-dir]}]
    (map->Migrator {:migration-dir migration-dir})))
 
+;; ——— Search Index ———
+
+(defrecord SearchIndex [search-configs
+                        ;; injected dependency
+                        datasource]
+  component/Lifecycle
+  (start [this]
+    (let [ds (:datasource datasource)]
+      (doseq [config search-configs]
+        (search/ensure-search! ds config))
+      (assoc this :initialized true)))
+
+  (stop [this]
+    (assoc this :initialized nil)))
+
+(defn search-index-component
+  "Creates a SearchIndex component that ensures BM25 indexes exist on start.
+   Depends on :datasource (must be started after migrator so tables exist).
+
+   search-configs: vector of search config maps, each with:
+     :table, :index-name, :key-field, :text-fields"
+  [search-configs]
+  (map->SearchIndex {:search-configs search-configs}))
+
 ;; ——— RabbitMQ Connection ———
 
 (defrecord RabbitMQConnection [mode host port username password uri
@@ -88,6 +121,14 @@
                                container connection]
   component/Lifecycle
   (start [this]
+    (when-not (#{:testcontainers :uri :direct} mode)
+      (throw (ex-info "Invalid RabbitMQConnection :mode — must be :testcontainers, :uri, or :direct"
+                      {:error/type :config/invalid-mode
+                       :mode       mode})))
+    (when (and (= :uri mode) (not uri))
+      (throw (ex-info "RabbitMQConnection :uri mode requires a :uri value"
+                      {:error/type :config/missing-field
+                       :mode       mode})))
     (case mode
       :testcontainers
       (let [rmq  (infra/start-rabbitmq!)

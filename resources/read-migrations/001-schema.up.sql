@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS account_balances (
   owner                TEXT NOT NULL DEFAULT '',
   balance              BIGINT NOT NULL DEFAULT 0,
   last_global_sequence BIGINT NOT NULL DEFAULT 0,
-  updated_at           TIMESTAMPTZ DEFAULT NOW()
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 --;;
 CREATE TABLE IF NOT EXISTS transfer_status (
@@ -19,5 +19,5 @@ CREATE TABLE IF NOT EXISTS transfer_status (
   status               TEXT NOT NULL DEFAULT 'initiated',
   failure_reason       TEXT,
   last_global_sequence BIGINT NOT NULL DEFAULT 0,
-  updated_at           TIMESTAMPTZ DEFAULT NOW()
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

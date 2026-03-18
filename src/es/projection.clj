@@ -28,7 +28,12 @@
                           es.projection-kit/make-handler"
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
-            [es.store :as store]))
+            [es.store :as store]
+            [es.projection-kit :as kit]))
+
+(def default-batch-size
+  "Default number of events to read per catch-up cycle."
+  1000)
 
 ;; ——— Projection identity/locking ———
 
@@ -38,27 +43,6 @@
    event application are deterministic and race-free."
   [tx projection-name]
   (store/advisory-lock! tx (str "projection:" projection-name)))
-
-;; ——— Validation helpers ———
-
-(defn- update-count
-  "Extracts update count from next.jdbc DML result maps."
-  [result]
-  (or (:next.jdbc/update-count result)
-      (:update-count result)
-      0))
-
-(defn- ensure-single-row-updated!
-  "Update events must affect exactly one read-model row.
-   If not, fail fast so the caller's transaction rolls back and
-   checkpoint advancement is prevented."
-  [projection-name result event]
-  (let [rows (update-count result)]
-    (when (not= 1 rows)
-      (throw (ex-info "Projection invariant violation: expected single-row update"
-                      {:projection-name projection-name
-                       :update-count    rows
-                       :event           event})))))
 
 ;; ——— Single-event projector ———
 
@@ -75,7 +59,7 @@
    tx
    event
    {:projection-name            projection-name
-    :ensure-single-row-updated! (partial ensure-single-row-updated! projection-name)}))
+    :ensure-single-row-updated! (partial kit/ensure-single-row-updated! projection-name)}))
 
 ;; ——— Catch-up: process new events since last checkpoint ———
 
@@ -86,13 +70,16 @@
    config is a map with:
      :projection-name   — string identifier for this projection
      :read-model-tables — vector of table name strings (used by rebuild!)
+   opts:
+     :batch-size — max events per transaction (default 1000)
 
    Concurrency + correctness guarantees:
    • projection-level advisory lock serialises workers
-   • all work runs in one transaction
+   • all work runs in one transaction (bounded by batch-size)
    • on any apply failure, transaction rolls back and checkpoint
      does not advance."
-  [ds {:keys [projection-name] :as config}]
+  [ds {:keys [projection-name] :as config}
+   & {:keys [batch-size] :or {batch-size default-batch-size}}]
   (jdbc/with-transaction [tx ds]
     (lock-projection! tx projection-name)
     (let [checkpoint
@@ -111,8 +98,10 @@
                      event_type, event_version, payload
               FROM events
               WHERE global_sequence > ?
-              ORDER BY global_sequence ASC"
-                          checkpoint]
+              ORDER BY global_sequence ASC
+              LIMIT ?"
+                          checkpoint
+                          batch-size]
                          {:builder-fn rs/as-unqualified-kebab-maps})
 
           new-events
@@ -140,30 +129,24 @@
   "Destroys and rebuilds the read model from the complete event stream.
    Useful after schema changes or bug fixes in the projector.
 
+   Truncates the read model tables and resets the checkpoint in one
+   transaction, then replays events in batches via process-new-events!.
+
    config is a map with:
      :projection-name   — string identifier for this projection
      :read-model-tables — vector of table name strings to truncate"
   [ds {:keys [projection-name read-model-tables] :as config}]
+  ;; Truncate and reset checkpoint in one transaction
   (jdbc/with-transaction [tx ds]
     (lock-projection! tx projection-name)
     (doseq [table read-model-tables]
+      (kit/validate-identifier! table "read-model-table")
       (jdbc/execute-one! tx [(str "DELETE FROM " table)]))
-    (jdbc/execute-one! tx ["DELETE FROM projection_checkpoints"])
-    (let [all-events
-          (mapv decode-event-row
-                (jdbc/execute! tx
-                               ["SELECT global_sequence, stream_id, stream_sequence,
-                          event_type, event_version, payload
-                    FROM events ORDER BY global_sequence ASC"]
-                               {:builder-fn rs/as-unqualified-kebab-maps}))]
-      (doseq [event all-events]
-        (project-event! tx event config))
-      (when (seq all-events)
-        (jdbc/execute-one! tx
-                           ["INSERT INTO projection_checkpoints (projection_name, last_global_sequence)
-            VALUES (?, ?)
-            ON CONFLICT (projection_name)
-            DO UPDATE SET last_global_sequence = EXCLUDED.last_global_sequence"
-                            projection-name
-                            (:global-sequence (peek all-events))]))
-      (count all-events))))
+    (jdbc/execute-one! tx ["DELETE FROM projection_checkpoints WHERE projection_name = ?"
+                           projection-name]))
+  ;; Replay in batches — each batch is its own bounded transaction
+  (loop [total 0]
+    (let [n (process-new-events! ds config :batch-size default-batch-size)]
+      (if (pos? n)
+        (recur (+ total n))
+        total))))

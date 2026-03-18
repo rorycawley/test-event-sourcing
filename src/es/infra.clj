@@ -12,7 +12,7 @@
 
 (def ^:const default-postgres-image
   "ParadeDB — PostgreSQL with pg_search extension for BM25 full-text search."
-  "paradedb/paradedb:latest")
+  "paradedb/paradedb:v0.21.12")
 
 (defn start-postgres!
   "Starts a ParadeDB container (PostgreSQL + pg_search for BM25 search).
@@ -50,7 +50,7 @@
   "Starts a RabbitMQ container. Returns a map of connection details
    plus the container reference (for stopping later)."
   []
-  (let [container (doto (RabbitMQContainer. "rabbitmq:3-management-alpine")
+  (let [container (doto (RabbitMQContainer. "rabbitmq:3.13-management-alpine")
                     (.start))]
     {:container container
      :host      (.getHost container)

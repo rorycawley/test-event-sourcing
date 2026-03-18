@@ -64,7 +64,7 @@
   (is (= 80 (:balance (account-projection/get-balance support/*ds* "bob"))))
 
   ;; Transfer status projected
-  (let [t (transfer-projection/get-transfer support/*ds* "transfer-tx-proj")]
+  (let [t (transfer-projection/get-transfer support/*ds* "tx-proj")]
     (is (= "completed" (:status t)))
     (is (= "alice" (:from-account t)))
     (is (= "bob" (:to-account t)))
@@ -97,7 +97,7 @@
   (saga/execute! support/*ds* "tx-fail-proj" "alice" "bob" 100)
   (system/process-new-events! support/*ds*)
 
-  (let [t (transfer-projection/get-transfer support/*ds* "transfer-tx-fail-proj")]
+  (let [t (transfer-projection/get-transfer support/*ds* "tx-fail-proj")]
     (is (= "failed" (:status t)))
     (is (= "insufficient-funds" (:failure-reason t)))))
 
@@ -126,9 +126,9 @@
                                           (store/load-stream support/*ds* "alice"))]
     (is (= 200 (:balance alice-state))))
 
-  ;; Transfer stream shows: initiated, debit-recorded, failed
+  ;; Transfer stream shows: initiated, debit-recorded, compensation-recorded, failed
   (let [events (store/load-stream support/*ds* "transfer-tx-comp-1")]
-    (is (= ["transfer-initiated" "debit-recorded" "transfer-failed"]
+    (is (= ["transfer-initiated" "debit-recorded" "compensation-recorded" "transfer-failed"]
            (mapv :event-type events)))))
 
 (deftest compensation-projection-balances-correct
@@ -140,7 +140,7 @@
   ;; Alice refunded
   (is (= 200 (:balance (account-projection/get-balance support/*ds* "alice"))))
 
-  (let [t (transfer-projection/get-transfer support/*ds* "transfer-tx-comp-proj")]
+  (let [t (transfer-projection/get-transfer support/*ds* "tx-comp-proj")]
     (is (= "failed" (:status t)))))
 
 ;; ——— Projection rebuild includes transfers ———
@@ -158,7 +158,7 @@
   (is (= 250 (:balance (account-projection/get-balance support/*ds* "alice"))))
   (is (= 150 (:balance (account-projection/get-balance support/*ds* "bob"))))
   (is (= "completed" (:status (transfer-projection/get-transfer support/*ds*
-                                                                "transfer-tx-rebuild")))))
+                                                                "tx-rebuild")))))
 
 ;; ——— Idempotency: re-executing the same transfer is safe ———
 
@@ -345,3 +345,90 @@
             (catch clojure.lang.ExceptionInfo ex ex))]
     (is (some? e))
     (is (= :saga/transfer-not-found (:error/type (ex-data e))))))
+
+;; ═══════════════════════════════════════════════════
+;; Crash safety — compensation + resume interleaving
+;; ═══════════════════════════════════════════════════
+;;
+;; Reproduces the bug where a crash after compensation refund
+;; but before fail-transfer! would let resume credit the
+;; destination, creating money. The :compensating state prevents this.
+
+(deftest resume-after-compensation-does-not-credit-destination
+  ;; Setup: Alice has 200, Ghost doesn't exist
+  (open-and-fund! "alice" "Alice" 200)
+
+  ;; Simulate a partial saga that:
+  ;; 1. Initiated the transfer
+  ;; 2. Debited Alice (withdraw 50)
+  ;; 3. Credit to Ghost failed → recorded compensation-recorded
+  ;; 4. Refunded Alice (deposit 50 back)
+  ;; 5. CRASHED before writing transfer-failed
+  ;;
+  ;; We manually perform steps 1-4 to set up the crash state.
+
+  ;; Debit Alice
+  (decider/handle! support/*ds* account/decider
+                   {:command-type    :withdraw
+                    :stream-id       "alice"
+                    :idempotency-key "transfer-tx-crash-comp-debit"
+                    :data            {:amount 50}})
+
+  ;; Refund Alice (compensation)
+  (decider/handle! support/*ds* account/decider
+                   {:command-type    :deposit
+                    :stream-id       "alice"
+                    :idempotency-key "transfer-tx-crash-comp-compensate"
+                    :data            {:amount 50}})
+
+  ;; Write transfer stream up to compensation-recorded (no transfer-failed)
+  (write-transfer-events!
+   "transfer-tx-crash-comp"
+   [{:event-type    "transfer-initiated"
+     :event-version 1
+     :payload       {:from-account "alice"
+                     :to-account   "ghost"
+                     :amount       50}}])
+  (store/append-events! support/*ds*
+                        "transfer-tx-crash-comp" 1
+                        "seed-tx-crash-comp-debit"
+                        {:command-type :seed :data {}}
+                        [{:event-type    "debit-recorded"
+                          :event-version 1
+                          :payload       {:account-id "alice" :amount 50}}])
+  (store/append-events! support/*ds*
+                        "transfer-tx-crash-comp" 2
+                        "seed-tx-crash-comp-compensation"
+                        {:command-type :seed :data {}}
+                        [{:event-type    "compensation-recorded"
+                          :event-version 1
+                          :payload       {:reason "account-not-open"}}])
+
+  ;; Now open Ghost — if the bug existed, resume would credit Ghost
+  (decider/handle! support/*ds* account/decider
+                   {:command-type    :open-account
+                    :stream-id       "ghost"
+                    :idempotency-key "setup-open-ghost"
+                    :data            {:owner "Ghost"}})
+
+  ;; Resume from :compensating — should complete the refund path,
+  ;; NOT attempt to credit Ghost
+  (let [result (saga/resume! support/*ds* "tx-crash-comp")]
+    (is (= :failed (:status result)))
+    (is (= "account-not-open" (:reason result))))
+
+  ;; Alice should be back to 200 (already refunded before crash)
+  (let [alice (decider/evolve-state account/decider
+                                    (store/load-stream support/*ds* "alice"))]
+    (is (= 200 (:balance alice))))
+
+  ;; Ghost should have 0 — no money created
+  (let [ghost (decider/evolve-state account/decider
+                                    (store/load-stream support/*ds* "ghost"))]
+    (is (= 0 (:balance ghost))))
+
+  ;; Transfer stream ends with transfer-failed
+  (let [events (store/load-stream support/*ds* "transfer-tx-crash-comp")]
+    (is (= ["transfer-initiated" "debit-recorded"
+            "compensation-recorded" "transfer-failed"]
+           (mapv :event-type events)))))

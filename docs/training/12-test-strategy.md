@@ -319,8 +319,8 @@ The saga tests are integration tests that verify the most complex behaviour in t
     (is (= :failed (:status result))))
   ;; Alice's balance restored
   (is (= 200 (:balance (evolve-state account/decider (load-stream *ds* "alice")))))
-  ;; Transfer events: initiated, debit-recorded, failed (compensation happened)
-  (is (= ["transfer-initiated" "debit-recorded" "transfer-failed"]
+  ;; Transfer events: initiated, debit, compensation refund, then failed
+  (is (= ["transfer-initiated" "debit-recorded" "compensation-recorded" "transfer-failed"]
          (mapv :event-type (load-stream *ds* "transfer-tx-comp-1")))))
 ```
 
@@ -866,6 +866,6 @@ No test suite is complete. Known gaps:
 | End-to-end | 1 | 3 | Full async pipeline |
 | Property-based | 2 | 4 | ~400 generated test cases |
 | Performance | 3 | ~5 | 7 metrics with regression detection |
-| **Total** | **28** | **~117** | **~196 test functions, ~529 assertions** |
+| **Total** | **28** | **~117** | **~200 test functions, ~554 assertions** |
 
 The numbers reflect a deliberate strategy: many simple unit tests at the bottom, fewer comprehensive integration tests in the middle, and a small number of expensive end-to-end tests at the top. Each layer trusts the layers below it and focuses on what only it can verify.

@@ -26,17 +26,14 @@ jobs:
         uses: DeLaGuardo/setup-clojure@13.4
         with:
           cli: latest
-          bb: latest
-          clj-kondo: latest
+          bb: "1.12.214"
+          clj-kondo: "2026.01.12"
 
       - name: Verify Docker is available
         run: docker info
 
-      - name: Lint
-        run: bb lint
-
-      - name: Smoke check
-        run: bb smoke
+      - name: Quality checks (lint + format + smoke)
+        run: bb check
 
       - name: Integration tests
         run: bb test
@@ -44,8 +41,8 @@ jobs:
       - name: Coverage report and threshold gate
         run: bb coverage
 
-      - name: Performance benchmark run
-        run: bb perf
+      - name: Performance regression check
+        run: bb perf-check
 
       - name: Publish performance summaries
         if: always()

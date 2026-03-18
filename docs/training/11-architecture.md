@@ -536,9 +536,15 @@ Because the outbox INSERT is in the same transaction as the event INSERT, they s
 **Current version:** Each row is processed individually. Read the batch, then for each row: publish, mark published. If row 5 fails, rows 1-4 are already committed. Row 5 and beyond will be retried.
 
 ```clojure
-(doseq [row rows]
-  (publish-fn message)
-  (jdbc/execute-one! ds ["UPDATE event_outbox SET published_at = NOW() WHERE id = ?" (:id row)]))
+(reduce
+ (fn [acc row]
+   (publish-fn message)
+   (jdbc/with-transaction [tx ds]
+     (jdbc/execute-one! tx
+       ["UPDATE event_outbox SET published_at = NOW()
+         WHERE id = ? AND published_at IS NULL" (:id row)]))
+   (inc acc))
+ 0 rows)
 ```
 
 ### Trade-off: ordering with multiple pollers
@@ -627,14 +633,14 @@ Attempt 5: process events → fail on #42 → consecutive-fails = 5
 
 **Why capture instead of re-reading?** If another process advances the checkpoint between the failure and the skip, re-reading would get a stale value. By capturing at failure time, we know exactly which event to skip.
 
-**The two-step skip API:** `skip-poison-event!` returns a function that takes `event-store-ds`:
+**Skip API:** `skip-poison-event!` processes any valid events before the poison, then advances the checkpoint past it:
 
 ```clojure
-(let [skip-fn (skip-poison-event! read-db-ds projection-name checkpoint on-poison)]
-  (skip-fn event-store-ds))
+(skip-poison-event! event-store-ds read-db-ds config
+                    poison-global-sequence on-poison)
 ```
 
-This separates "prepare to skip" (which needs the read DB) from "execute skip" (which needs the event store to look up the poison event).
+It loops one event at a time: valid events are projected normally, and the poison event is skipped (checkpoint advances past it).
 
 ### Recovery via rebuild
 

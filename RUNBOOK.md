@@ -99,8 +99,17 @@ Stop the projector consumer first to avoid interleaving:
 
 1. Stop the application
 2. Connect to both databases
-3. Truncate read model tables + projection_checkpoints
-4. Start the application — projectors will catch up from global_sequence 0
+3. Drop BM25 search indexes before truncating (TRUNCATE invalidates pg_search indexes):
+   ```clojure
+   (es.search/drop-search! read-db-ds {:index-name "idx_account_balances_search"})
+   ```
+   Or via SQL: `DROP INDEX IF EXISTS idx_account_balances_search;`
+4. Truncate read model tables + projection_checkpoints
+5. Start the application — projectors will catch up from global_sequence 0
+6. Recreate BM25 search indexes after the rebuild completes:
+   ```clojure
+   (es.search/ensure-search! read-db-ds bank.account-projection/search-index-config)
+   ```
 
 ### Important notes
 
@@ -207,14 +216,16 @@ If the count is growing, check:
 
 ### Transfer saga events and the outbox
 
-The transfer saga (`bank.transfer-saga`) does **not** use the outbox hook. Its
-events (transfer-initiated, debit-recorded, credit-recorded, transfer-completed)
-are written directly to the event store without outbox rows. They are picked up
-by the projectors' **catch-up timer** (default 30s, 1s in tests).
+The transfer saga (`bank.transfer-saga`) accepts an optional `:on-events-appended`
+hook. When provided (e.g. the transactional outbox hook from `es.outbox`), every
+command in the saga — account debits/credits and transfer progress events — flows
+through the hook for real-time projection updates via the outbox → RabbitMQ
+pipeline. Without the hook, events are picked up by the projectors' **catch-up
+timer** (default 30s, 1s in tests).
 
-This means transfer status projections can be delayed by up to the catch-up
-interval. If faster transfer projections are needed, reduce
-`:catch-up-interval-ms` on the transfer projector.
+If calling `execute!` or `resume!` without the outbox hook, transfer status
+projections can be delayed by up to the catch-up interval. Pass the outbox hook
+for real-time updates, or reduce `:catch-up-interval-ms` on the transfer projector.
 
 ### Saga crash recovery
 
