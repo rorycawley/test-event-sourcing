@@ -428,7 +428,7 @@ Then evaluate the commented forms in `user.clj` step by step.
 ### Running Tests
 
 ```bash
-# All tests (200 tests, 554 assertions)
+# All tests
 bb test
 
 # Fuzz/property-based tests only (filters by namespace pattern)

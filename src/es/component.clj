@@ -15,12 +15,31 @@
             [es.rabbitmq :as rabbitmq]
             [es.outbox :as outbox]
             [es.async-projection :as async-projection]
-            [es.search :as search]
-            [next.jdbc :as jdbc]))
+            [es.search :as search])
+  (:import [com.zaxxer.hikari HikariDataSource HikariConfig]))
 
 ;; ——— Datasource ———
 
+(defn- make-hikari-datasource
+  "Creates a HikariCP pooled datasource for production use.
+   Accepts the same pool options as datasource-component."
+  [{:keys [jdbc-url user password
+           maximum-pool-size minimum-idle
+           connection-timeout idle-timeout max-lifetime]}]
+  (let [config (doto (HikariConfig.)
+                 (.setJdbcUrl jdbc-url)
+                 (.setMaximumPoolSize (or maximum-pool-size 10))
+                 (.setMinimumIdle (or minimum-idle 2))
+                 (.setConnectionTimeout (or connection-timeout 30000))
+                 (.setIdleTimeout (or idle-timeout 600000))
+                 (.setMaxLifetime (or max-lifetime 1800000)))]
+    (when user (.setUsername config user))
+    (when password (.setPassword config password))
+    (HikariDataSource. config)))
+
 (defrecord Datasource [mode jdbc-url user password image
+                       maximum-pool-size minimum-idle
+                       connection-timeout idle-timeout max-lifetime
                        ;; runtime state
                        container datasource]
   component/Lifecycle
@@ -42,13 +61,12 @@
                :datasource ds))
 
       :jdbc-url
-      (let [opts (cond-> {:jdbcUrl jdbc-url}
-                   user     (assoc :user user)
-                   password (assoc :password password))
-            ds (jdbc/get-datasource opts)]
+      (let [ds (make-hikari-datasource this)]
         (assoc this :datasource ds))))
 
   (stop [this]
+    (when (and (= :jdbc-url mode) datasource)
+      (.close ^HikariDataSource datasource))
     (when (and (= :testcontainers mode) container)
       (infra/stop-postgres! container))
     (assoc this :container nil :datasource nil)))
@@ -59,13 +77,19 @@
    opts:
      {:mode :testcontainers}  — starts a ParadeDB container (dev/test)
      {:mode :testcontainers :image \"postgres:17-alpine\"}  — override image
-     {:mode :jdbc-url :jdbc-url \"...\" :user \"...\" :password \"...\"}  — production"
-  [{:keys [mode jdbc-url user password image]}]
-  (map->Datasource {:mode     mode
-                    :jdbc-url jdbc-url
-                    :user     user
-                    :password password
-                    :image    image}))
+     {:mode :jdbc-url :jdbc-url \"...\" :user \"...\" :password \"...\"}  — production
+
+   Pool options (jdbc-url mode only, HikariCP):
+     :maximum-pool-size  — max connections (default 10)
+     :minimum-idle       — min idle connections (default 2)
+     :connection-timeout — wait for connection ms (default 30000)
+     :idle-timeout       — idle connection eviction ms (default 600000)
+     :max-lifetime       — max connection age ms (default 1800000)"
+  [opts]
+  (map->Datasource (select-keys opts [:mode :jdbc-url :user :password :image
+                                      :maximum-pool-size :minimum-idle
+                                      :connection-timeout :idle-timeout
+                                      :max-lifetime])))
 
 ;; ——— Migrator ———
 

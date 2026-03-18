@@ -17,6 +17,7 @@
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [clojure.data.json :as json]
+            [clojure.tools.logging :as log]
             [es.store :as store]))
 
 ;; ——— Outbox writing (called within store transaction) ———
@@ -118,8 +119,7 @@
   [ds publish-fn & {:keys [poll-interval-ms batch-size on-error]
                     :or   {poll-interval-ms 100
                            batch-size       100
-                           on-error         (fn [e] (binding [*out* *err*]
-                                                      (println "Outbox poller error:" (.getMessage e))))}}]
+                           on-error         (fn [e] (log/error e "Outbox poller error"))}}]
   (let [running (atom true)
         thread  (Thread.
                  (fn []
@@ -145,5 +145,4 @@
   (.interrupt ^Thread thread)
   (.join ^Thread thread 5000)
   (when (.isAlive ^Thread thread)
-    (binding [*out* *err*]
-      (println "WARNING: outbox poller thread did not stop within 5 seconds"))))
+    (log/warn "Outbox poller thread did not stop within 5 seconds")))

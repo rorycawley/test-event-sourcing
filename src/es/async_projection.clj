@@ -36,6 +36,7 @@
    - A full rebuild! will replay all events including previously skipped ones"
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
+            [clojure.tools.logging :as log]
             [es.store :as store]
             [es.projection-kit :as kit]
             [es.rabbitmq :as rabbitmq]))
@@ -239,14 +240,13 @@
       :or   {catch-up-interval-ms     30000
              max-consecutive-failures 5
              batch-size               default-batch-size
-             on-error (fn [e] (binding [*out* *err*]
-                                (println "Async projector error:" (.getMessage e))))
+             on-error (fn [e] (log/error e "Async projector error"
+                                         {:projection (:projection-name config)}))
              on-poison (fn [event]
-                         (binding [*out* *err*]
-                           (println "POISON EVENT SKIPPED:"
-                                    (:projection-name config)
-                                    "global_sequence=" (:global-sequence event)
-                                    "event_type=" (:event-type event))))}}]
+                         (log/warn "POISON EVENT SKIPPED"
+                                   {:projection      (:projection-name config)
+                                    :global-sequence  (:global-sequence event)
+                                    :event-type       (:event-type event)}))}}]
   (let [running           (atom true)
         catching-up?      (atom false)
         consecutive-fails (atom 0)
@@ -326,6 +326,12 @@
         ;; processes ALL pending events, there's no benefit to prefetching.
         _  (rabbitmq/set-prefetch! ch 1)
 
+        ;; Run an immediate catch-up before starting the consumer or timer.
+        ;; This ensures events written while the projector was down are
+        ;; processed right away rather than waiting for the first timer tick
+        ;; or the next RabbitMQ notification.
+        _  (do-catch-up!)
+
         consumer-tag
         (rabbitmq/consume! ch queue-name handler-fn)
 
@@ -361,6 +367,5 @@
   (.interrupt ^Thread catch-up-timer)
   (.join ^Thread catch-up-timer 5000)
   (when (.isAlive ^Thread catch-up-timer)
-    (binding [*out* *err*]
-      (println "WARNING: catch-up timer thread did not stop within 5 seconds"
-               (.getName ^Thread catch-up-timer)))))
+    (log/warn "Catch-up timer thread did not stop within 5 seconds"
+              {:thread (.getName ^Thread catch-up-timer)})))
