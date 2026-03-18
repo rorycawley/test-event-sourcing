@@ -6,7 +6,14 @@
    rows and publishes them to RabbitMQ.
 
    This guarantees at-least-once delivery: if the process crashes between
-   append and publish, the outbox row survives and the poller retries."
+   append and publish, the outbox row survives and the poller retries.
+
+   Ordering
+   ────────
+   Events are published in global_sequence order within a single poller.
+   If multiple pollers run concurrently (via FOR UPDATE SKIP LOCKED),
+   inter-poller ordering is NOT guaranteed. Consumers must be idempotent
+   and tolerate out-of-order delivery."
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [clojure.data.json :as json]
@@ -40,11 +47,15 @@
   "Single poll cycle: reads unpublished outbox rows, loads the
    corresponding events, publishes each to RabbitMQ, marks as published.
 
+   Each row is published and marked individually: if publish-fn throws
+   on row N, rows 1..N-1 are already committed (not rolled back).
+   This avoids re-publishing events that were already sent to RabbitMQ.
+
    Uses FOR UPDATE SKIP LOCKED so multiple pollers can run safely.
    Returns the count of events published."
   [ds publish-fn batch-size]
-  (jdbc/with-transaction [tx ds]
-    (let [rows (jdbc/execute! tx
+  (let [rows (jdbc/with-transaction [tx ds]
+               (jdbc/execute! tx
                               ["SELECT o.id, o.global_sequence,
                                        e.stream_id, e.event_type,
                                        e.event_version, e.payload
@@ -55,22 +66,24 @@
                                 LIMIT ?
                                 FOR UPDATE OF o SKIP LOCKED"
                                batch-size]
-                              {:builder-fn rs/as-unqualified-kebab-maps})]
-      (doseq [row rows]
-        (let [payload (store/<-pgobject (:payload row))
-              message (json/write-str
-                       {:global-sequence (:global-sequence row)
-                        :stream-id       (:stream-id row)
-                        :event-type      (:event-type row)
-                        :event-version   (:event-version row)
-                        :payload         payload})]
-          (publish-fn message)
-          (jdbc/execute-one! tx
-                             ["UPDATE event_outbox
-                               SET published_at = NOW()
-                               WHERE id = ?"
-                              (:id row)])))
-      (count rows))))
+                              {:builder-fn rs/as-unqualified-kebab-maps}))]
+    ;; Process each row in its own transaction so that a failure on row N
+    ;; doesn't roll back the already-published rows 1..N-1.
+    (doseq [row rows]
+      (let [payload (store/<-pgobject (:payload row))
+            message (json/write-str
+                     {:global-sequence (:global-sequence row)
+                      :stream-id       (:stream-id row)
+                      :event-type      (:event-type row)
+                      :event-version   (:event-version row)
+                      :payload         payload})]
+        (publish-fn message)
+        (jdbc/execute-one! ds
+                           ["UPDATE event_outbox
+                             SET published_at = NOW()
+                             WHERE id = ?"
+                            (:id row)])))
+    (count rows)))
 
 ;; ——— Poller loop ———
 
@@ -107,8 +120,12 @@
     {:thread thread :running running}))
 
 (defn stop-poller!
-  "Stops the outbox poller and waits for it to finish."
+  "Stops the outbox poller and waits up to 5 seconds for it to finish.
+   Logs a warning if the thread is still alive after the timeout."
   [{:keys [thread running]}]
   (reset! running false)
   (.interrupt ^Thread thread)
-  (.join ^Thread thread 5000))
+  (.join ^Thread thread 5000)
+  (when (.isAlive ^Thread thread)
+    (binding [*out* *err*]
+      (println "WARNING: outbox poller thread did not stop within 5 seconds"))))

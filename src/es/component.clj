@@ -19,14 +19,14 @@
 
 ;; ——— Datasource ———
 
-(defrecord Datasource [mode jdbc-url user password
+(defrecord Datasource [mode jdbc-url user password image
                        ;; runtime state
                        container datasource]
   component/Lifecycle
   (start [this]
     (case mode
       :testcontainers
-      (let [pg (infra/start-postgres!)
+      (let [pg (infra/start-postgres! :image (or image infra/default-postgres-image))
             ds (infra/->datasource pg)]
         (assoc this
                :container pg
@@ -48,13 +48,15 @@
   "Creates a Datasource component.
 
    opts:
-     {:mode :testcontainers}  — starts a Postgres container (dev/test)
+     {:mode :testcontainers}  — starts a ParadeDB container (dev/test)
+     {:mode :testcontainers :image \"postgres:17-alpine\"}  — override image
      {:mode :jdbc-url :jdbc-url \"...\" :user \"...\" :password \"...\"}  — production"
-  [{:keys [mode jdbc-url user password]}]
+  [{:keys [mode jdbc-url user password image]}]
   (map->Datasource {:mode     mode
                     :jdbc-url jdbc-url
                     :user     user
-                    :password password}))
+                    :password password
+                    :image    image}))
 
 ;; ——— Migrator ———
 
@@ -112,10 +114,15 @@
         (assoc this :connection conn))))
 
   (stop [this]
-    (when connection
-      (rabbitmq/disconnect! connection))
-    (when (and (= :testcontainers mode) container)
-      (infra/stop-rabbitmq! container))
+    (try
+      (when connection
+        (rabbitmq/disconnect! connection))
+      (finally
+        (try
+          (when (and (= :testcontainers mode) container)
+            (infra/stop-rabbitmq! container))
+          (finally
+            (identity nil)))))
     (assoc this :connection nil :container nil)))
 
 (defn rabbitmq-component
@@ -149,10 +156,12 @@
       (assoc this :channel ch :poller p)))
 
   (stop [this]
-    (when poller
-      (outbox/stop-poller! poller))
-    (when channel
-      (rabbitmq/close-channel channel))
+    (try
+      (when poller
+        (outbox/stop-poller! poller))
+      (finally
+        (when channel
+          (rabbitmq/close-channel channel))))
     (assoc this :channel nil :poller nil)))
 
 (defn outbox-poller-component
@@ -195,10 +204,12 @@
       (assoc this :channel ch :consumer c)))
 
   (stop [this]
-    (when consumer
-      (async-projection/stop-consumer! consumer))
-    (when channel
-      (rabbitmq/close-channel channel))
+    (try
+      (when consumer
+        (async-projection/stop-consumer! consumer))
+      (finally
+        (when channel
+          (rabbitmq/close-channel channel))))
     (assoc this :channel nil :consumer nil)))
 
 (defn async-projector-component

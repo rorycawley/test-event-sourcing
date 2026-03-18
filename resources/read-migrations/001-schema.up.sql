@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS projection_checkpoints (
 --;;
 CREATE TABLE IF NOT EXISTS account_balances (
   account_id           TEXT PRIMARY KEY,
+  owner                TEXT NOT NULL DEFAULT '',
   balance              BIGINT NOT NULL DEFAULT 0,
   last_global_sequence BIGINT NOT NULL DEFAULT 0,
   updated_at           TIMESTAMPTZ DEFAULT NOW()

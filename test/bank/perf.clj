@@ -4,10 +4,12 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [bank.account :as account]
+            [bank.account-projection :as account-projection]
             [bank.system :as system]
             [es.decider :as decider]
             [es.infra :as infra]
             [es.migrations :as migrations]
+            [es.search :as search]
             [es.store :as store]
             [next.jdbc :as jdbc])
   (:import [java.lang.management ManagementFactory]
@@ -231,6 +233,44 @@
        :duration-ms               (ns->ms duration-ns)
        :throughput-events-per-sec (/ rebuilt (ns->sec duration-ns))})))
 
+(defn- seed-search-workload!
+  "Seeds account_balances with n accounts, each with a distinct owner.
+   Uses direct store/append-events! + projection for realistic data."
+  [ds n]
+  (reset-db! ds)
+  (doseq [i (range n)]
+    (let [stream-id (str "perf-search-" i)
+          owner     (str "Owner " (char (+ (int \A) (mod i 26))) " " i)]
+      (store/append-events! ds stream-id 0 nil
+                            {:command-type :open-account
+                             :data         {:owner owner}}
+                            [{:event-type    "account-opened"
+                              :event-version 1
+                              :payload       {:owner owner}}])))
+  (system/process-new-events! ds)
+  n)
+
+(defn- benchmark-search-latency!
+  "Measures BM25 search latency on account_balances.
+   Seeds accounts, creates BM25 index, then measures search queries."
+  [ds {:keys [search-accounts search-warmup search-samples]}]
+  (let [_ (seed-search-workload! ds search-accounts)]
+    (search/ensure-search! ds account-projection/search-index-config)
+    ;; Warmup
+    (doseq [_ (range search-warmup)]
+      (account-projection/search-accounts ds "owner:Owner"))
+    ;; Measure
+    (let [queries ["owner:Owner"
+                   "owner:A"
+                   "Owner"
+                   "owner:\"Owner A\""]]
+      (latency-stats
+       (measure-latencies
+        search-samples
+        (fn [i]
+          (let [query (nth queries (mod i (count queries)))]
+            (account-projection/search-accounts ds query :limit 10))))))))
+
 (defn- format-ms [value]
   (format "%.3f" (double value)))
 
@@ -251,7 +291,9 @@
    "| idempotent-samples | " (:idempotent-samples config) " |\n"
    "| store-events | " (:store-events config) " |\n"
    "| projection-accounts | " (:projection-accounts config) " |\n"
-   "| projection-deposits-per-account | " (:projection-deposits-per-account config) " |\n\n"
+   "| projection-deposits-per-account | " (:projection-deposits-per-account config) " |\n"
+   "| search-accounts | " (:search-accounts config) " |\n"
+   "| search-samples | " (:search-samples config) " |\n\n"
    "## Metrics\n\n"
    "| Metric | Value |\n"
    "| --- | --- |\n"
@@ -261,7 +303,11 @@
    "| idempotent replay p95 latency | " (format-ms (get-in metrics [:idempotent-replay-latency :p95-ms])) " ms |\n"
    "| store/append-events! throughput | " (format-eps (get-in metrics [:store-append-throughput :throughput-events-per-sec])) " events/s |\n"
    "| projection/process-new-events! throughput | " (format-eps (get-in metrics [:projection-process-throughput :throughput-events-per-sec])) " events/s |\n"
-   "| projection/rebuild! throughput | " (format-eps (get-in metrics [:projection-rebuild-throughput :throughput-events-per-sec])) " events/s |\n"))
+   "| projection/rebuild! throughput | " (format-eps (get-in metrics [:projection-rebuild-throughput :throughput-events-per-sec])) " events/s |\n"
+   "| search (sync) p50 latency | " (format-ms (get-in metrics [:search-sync-latency :p50-ms])) " ms |\n"
+   "| search (sync) p95 latency | " (format-ms (get-in metrics [:search-sync-latency :p95-ms])) " ms |\n"
+   "| search (async read DB) p50 latency | " (format-ms (get-in metrics [:search-async-latency :p50-ms])) " ms |\n"
+   "| search (async read DB) p95 latency | " (format-ms (get-in metrics [:search-async-latency :p95-ms])) " ms |\n"))
 
 (defn- build-config []
   {:handle-warmup                  (env-int "PERF_HANDLE_WARMUP" 30)
@@ -269,15 +315,21 @@
    :idempotent-samples             (env-int "PERF_IDEMPOTENT_SAMPLES" 200)
    :store-events                   (env-int "PERF_STORE_EVENTS" 1500)
    :projection-accounts            (env-int "PERF_PROJECTION_ACCOUNTS" 150)
-   :projection-deposits-per-account (env-int "PERF_PROJECTION_DEPOSITS_PER_ACCOUNT" 10)})
+   :projection-deposits-per-account (env-int "PERF_PROJECTION_DEPOSITS_PER_ACCOUNT" 10)
+   :search-accounts                 (env-int "PERF_SEARCH_ACCOUNTS" 500)
+   :search-warmup                   (env-int "PERF_SEARCH_WARMUP" 20)
+   :search-samples                  (env-int "PERF_SEARCH_SAMPLES" 200)})
 
 (defn run-benchmarks!
   []
-  (let [config (build-config)
-        pg     (infra/start-postgres!)
-        ds     (infra/->datasource pg)]
+  (let [config  (build-config)
+        pg      (infra/start-postgres!)
+        ds      (infra/->datasource pg)
+        read-pg (infra/start-postgres!)
+        read-ds (infra/->datasource read-pg)]
     (try
       (migrations/migrate! ds)
+      (migrations/migrate! read-ds :migration-dir "read-migrations")
       {:meta
        {:generated-at (str (Instant/now))
         :git-sha      (git-sha)
@@ -287,12 +339,44 @@
         :jvm-name     (.getName (ManagementFactory/getRuntimeMXBean))}
        :config config
        :metrics
-       {:decider-handle-latency      (benchmark-handle-latency! ds config)
-        :idempotent-replay-latency   (benchmark-idempotent-replay-latency! ds config)
-        :store-append-throughput     (benchmark-store-append-throughput! ds config)
+       {:decider-handle-latency       (benchmark-handle-latency! ds config)
+        :idempotent-replay-latency    (benchmark-idempotent-replay-latency! ds config)
+        :store-append-throughput      (benchmark-store-append-throughput! ds config)
         :projection-process-throughput (benchmark-projection-process-throughput! ds config)
-        :projection-rebuild-throughput (benchmark-projection-rebuild-throughput! ds config)}}
+        :projection-rebuild-throughput (benchmark-projection-rebuild-throughput! ds config)
+        :search-sync-latency          (benchmark-search-latency! ds config)
+        :search-async-latency         (do
+                                        ;; Seed the read DB: insert accounts + project
+                                        (seed-search-workload! ds (:search-accounts config))
+                                        ;; Copy projected data to read DB
+                                        (let [rows (jdbc/execute! ds
+                                                                  ["SELECT account_id, owner, balance, last_global_sequence
+                                                                    FROM account_balances"])]
+                                          (doseq [row rows]
+                                            (jdbc/execute-one! read-ds
+                                                               ["INSERT INTO account_balances
+                                                                   (account_id, owner, balance, last_global_sequence, updated_at)
+                                                                 VALUES (?, ?, ?, ?, NOW())
+                                                                 ON CONFLICT (account_id) DO NOTHING"
+                                                                (:account_balances/account_id row)
+                                                                (:account_balances/owner row)
+                                                                (:account_balances/balance row)
+                                                                (:account_balances/last_global_sequence row)])))
+                                        (search/ensure-search! read-ds account-projection/search-index-config)
+                                        ;; Warmup
+                                        (doseq [_ (range (:search-warmup config))]
+                                          (account-projection/search-accounts read-ds "owner:Owner"))
+                                        ;; Measure on separate read DB
+                                        (let [queries ["owner:Owner" "owner:A" "Owner" "owner:\"Owner A\""]]
+                                          (latency-stats
+                                           (measure-latencies
+                                            (:search-samples config)
+                                            (fn [i]
+                                              (account-projection/search-accounts
+                                               read-ds (nth queries (mod i (count queries)))
+                                               :limit 10))))))}}
       (finally
+        (infra/stop-postgres! read-pg)
         (infra/stop-postgres! pg)))))
 
 (defn -main

@@ -2,7 +2,7 @@
 
 A reference implementation of event sourcing using the **Decider pattern** (Chassaing) and **Pull-Transform-Push** (Tellman), backed by PostgreSQL and RabbitMQ.
 
-Implements a bank account domain to demonstrate: append-only event storage, optimistic concurrency with retry, command idempotency, event versioning with upcasting, data-driven projections, cross-aggregate saga coordination (fund transfers), transactional outbox publishing, and async CQRS projections to a separate read database.
+Implements a bank account domain to demonstrate: append-only event storage, optimistic concurrency with retry, command idempotency, event versioning with upcasting, data-driven projections, cross-aggregate saga coordination (fund transfers), transactional outbox publishing, async CQRS projections to a separate read database, and BM25 full-text search via ParadeDB.
 
 ## Architecture
 
@@ -187,6 +187,43 @@ Read models are derived, disposable views built from the event stream.
 
 Both modes use data-driven dispatch via `es.projection-kit/make-handler`.
 
+### BM25 Full-Text Search
+
+The framework includes generic BM25 full-text search via [ParadeDB](https://www.paradedb.com/) `pg_search`, a PostgreSQL extension that provides Tantivy-backed relevance-ranked search.
+
+**`es.search`** provides three functions:
+
+- **`ensure-search!`** — Creates the `pg_search` extension and a BM25 index on a table. Idempotent, safe to call on every startup. Validates all identifiers against an allowlist to prevent SQL injection in DDL.
+- **`drop-search!`** — Drops a BM25 index (useful before rebuilds or TRUNCATE).
+- **`make-searcher`** — Factory that returns a search function `(fn [ds query & {:keys [limit offset]}])` with BM25 relevance scoring.
+
+Search queries use Tantivy query syntax:
+
+```clojure
+;; Search all indexed fields
+(search-accounts ds "Alice")
+
+;; Search a specific field
+(search-accounts ds "owner:Alice")
+
+;; Exact phrase search
+(search-accounts ds "owner:\"Alice Smith\"")
+
+;; With pagination
+(search-accounts ds "owner:Alice" :limit 10 :offset 20)
+```
+
+Results include a `:score` field (BM25 relevance) and are ordered by score descending. The search index is declared as data:
+
+```clojure
+{:table       "account_balances"
+ :index-name  "idx_account_balances_search"
+ :key-field   "account_id"
+ :text-fields ["owner"]}
+```
+
+Both the synchronous (single-DB) and async (separate read-DB) modes support search — just pass the appropriate datasource.
+
 ### Component Lifecycle
 
 Infrastructure is managed by Stuart Sierra's [Component](https://github.com/stuartsierra/component) library. All component records live in `es.component` (domain-agnostic); system assembly lives in `bank.components` (domain-specific).
@@ -230,6 +267,7 @@ src/
 │   ├── async_projection.clj     #   Async read model (two-DB, batched, poison-event handling)
 │   ├── outbox.clj               #   Transactional outbox (record + poll + publish)
 │   ├── rabbitmq.clj             #   Thin Langohr wrapper (connect, publish, consume, DLQ, QoS)
+│   ├── search.clj               #   Generic BM25 full-text search (ParadeDB pg_search)
 │   ├── component.clj            #   Component records (Datasource, Migrator, RabbitMQ, etc.)
 │   ├── saga.clj                 #   Reusable saga coordination helpers
 │   ├── schema.clj               #   Shared Malli schemas
@@ -241,7 +279,7 @@ src/
 │   ├── account.clj              #   Account Decider (decide/evolve) — pure, no I/O
 │   ├── transfer.clj             #   Transfer Decider (decide/evolve) — pure, no I/O
 │   ├── transfer_saga.clj        #   Saga coordinator for cross-account transfers
-│   ├── account_projection.clj   #   Account projection handler specs + query
+│   ├── account_projection.clj   #   Account projection handler specs + query + search
 │   ├── transfer_projection.clj  #   Transfer projection handler specs + query
 │   ├── system.clj               #   Synchronous composition root (single-DB wiring)
 │   └── components.clj           #   Component system assembly (dev, full, production)
@@ -257,6 +295,7 @@ test/
 │   ├── functional_test.clj      #   End-to-end lifecycle tests (DB)
 │   ├── integration_test.clj     #   Concurrency, idempotency, projection tests (DB)
 │   ├── async_integration_test.clj#  Full async pipeline end-to-end (3 testcontainers)
+│   ├── search_test.clj          #   BM25 search integration tests (ParadeDB)
 │   ├── fuzz_unit_test.clj       #   Property-based domain tests
 │   ├── fuzz_integration_test.clj#   Property-based integration tests (DB)
 │   ├── perf.clj                 #   Performance benchmarks
@@ -276,16 +315,15 @@ test/
 │   ├── outbox_test.clj          #   Outbox record, poll, and publish tests (DB)
 │   ├── component_test.clj       #   Component lifecycle tests
 │   ├── saga_test.clj            #   Saga helper tests
+│   ├── search_test.clj          #   Framework-level BM25 search tests (ParadeDB)
 │   ├── migrations_test.clj      #   Migration wrapper tests
 │   └── migrations_cli_test.clj  #   CLI interface tests
 
 resources/
 ├── migrations/                  # Event store SQL migrations (Migratus)
-│   ├── 20260315000000-create-events.{up,down}.sql
-│   ├── 20260316000000-create-projections.{up,down}.sql
-│   └── 20260318000000-create-event-outbox.{up,down}.sql
+│   └── 001-schema.{up,down}.sql
 └── read-migrations/             # Read store SQL migrations (separate DB)
-    └── 20260318100000-create-read-model-tables.{up,down}.sql
+    └── 001-schema.{up,down}.sql
 
 RUNBOOK.md                       # Operational procedures for async projections
 ```
@@ -308,8 +346,9 @@ idempotency_keys (idempotency_key TEXT PK,
                   command_payload JSONB, created_at TIMESTAMPTZ)
 
 -- Synchronous projection read models (single-DB mode)
-account_balances (account_id TEXT PK, balance BIGINT,
-                  last_global_sequence BIGINT, updated_at TIMESTAMPTZ)
+account_balances (account_id TEXT PK, owner TEXT,
+                  balance BIGINT, last_global_sequence BIGINT,
+                  updated_at TIMESTAMPTZ)
 
 transfer_status (transfer_id TEXT PK, from_account TEXT,
                  to_account TEXT, amount BIGINT,
@@ -333,8 +372,9 @@ event_outbox (id BIGSERIAL PK, global_sequence BIGINT UNIQUE,
 projection_checkpoints (projection_name TEXT PK,
                         last_global_sequence BIGINT)
 
-account_balances (account_id TEXT PK, balance BIGINT,
-                  last_global_sequence BIGINT, updated_at TIMESTAMPTZ)
+account_balances (account_id TEXT PK, owner TEXT,
+                  balance BIGINT, last_global_sequence BIGINT,
+                  updated_at TIMESTAMPTZ)
 
 transfer_status (transfer_id TEXT PK, from_account TEXT,
                  to_account TEXT, amount BIGINT,
@@ -346,7 +386,7 @@ transfer_status (transfer_id TEXT PK, from_account TEXT,
 
 - Java 21
 - [Babashka](https://github.com/babashka/babashka) (task runner)
-- Docker (for Testcontainers -- runs disposable PostgreSQL 16 and RabbitMQ instances)
+- Docker (for Testcontainers -- runs disposable ParadeDB and RabbitMQ instances)
 - [clj-kondo](https://github.com/clj-kondo/clj-kondo) (linting, optional)
 - [cljfmt](https://github.com/weavejester/cljfmt) (formatting, optional)
 
@@ -388,7 +428,7 @@ Then evaluate the commented forms in `user.clj` step by step.
 ### Running Tests
 
 ```bash
-# All tests (175 tests, 477 assertions)
+# All tests (196 tests, 529 assertions)
 bb test
 
 # Fuzz/property-based tests only (filters by namespace pattern)
@@ -487,12 +527,13 @@ The REPL integration is configured via:
 | Unit | `account_test`, `transfer_test`, `decider_test`, `decider_kit_test`, `store_test`, `projection_kit_test`, `saga_test` | Pure domain logic, command handler wiring, store utilities, factory functions | No |
 | Functional | `functional_test` | End-to-end lifecycle (open → deposit → withdraw → projection) | Yes |
 | Integration | `integration_test`, `store_integration_test`, `transfer_saga_test`, `projection_test` | Concurrency, idempotency, migrations, projection correctness, cross-account sagas | Yes (1× Postgres) |
-| Async | `async_projection_test`, `outbox_test`, `component_test` | Outbox record/poll/publish, two-database projection, batch processing, Component lifecycle | Yes (2× Postgres) |
+| Async | `async_projection_test`, `outbox_test`, `component_test` | Outbox record/poll/publish, two-database projection, batch processing, poison event handling, Component lifecycle | Yes (2× Postgres) |
 | End-to-end | `async_integration_test` | Full async pipeline: command → outbox → RabbitMQ → projector → read DB | Yes (2× Postgres + RabbitMQ) |
+| Search | `es/search_test`, `bank/search_test` | BM25 index lifecycle, relevance ranking, field-specific queries, SQL injection prevention, end-to-end command → projection → search | Yes (ParadeDB) |
 | Property-based | `fuzz_unit_test`, `fuzz_integration_test` | Random command sequences never violate invariants; projection rebuild matches incremental | Mixed |
 | Performance | `perf`, `perf_check` | Latency and throughput benchmarks with regression detection | Yes |
 
-All DB-backed tests use Testcontainers (PostgreSQL 16 Alpine, RabbitMQ 3 Management Alpine) -- no external database setup required.
+All DB-backed tests use Testcontainers (ParadeDB for PostgreSQL + BM25 search, RabbitMQ 3 Management Alpine) -- no external database setup required.
 
 ## Dependencies
 
@@ -534,7 +575,82 @@ All DB-backed tests use Testcontainers (PostgreSQL 16 Alpine, RabbitMQ 3 Managem
 
 **Poison event resilience** -- After configurable consecutive failures (default 5), poison events are skipped and the projector resumes processing. The `on-poison` callback enables alerting. A full rebuild replays all events including previously skipped ones. This prevents a single bad event from permanently blocking a projector.
 
+**BM25 search as a projection concern** -- Search indexes are created via `es.search/ensure-search!`, not in SQL migrations, because the Tantivy-backed BM25 index has different lifecycle concerns than schema DDL (e.g. must be recreated after TRUNCATE, uses DELETE not TRUNCATE between tests). ParadeDB provides native PostgreSQL BM25 search with no external search service required.
+
 **Framework/domain separation** -- All infrastructure (`es.*`) is domain-agnostic. The bank domain is just one consumer. Adding a new domain means writing new deciders, projections, and a system assembly — the framework doesn't change.
+
+## Layered Architecture
+
+The codebase uses a **two-layer split** — framework (`es.*`) and domain (`bank.*`) — rather than a deeper layered architecture like hexagonal/onion/DDD layers. This section explains what we have, what we considered, and why we stopped here.
+
+### Current dependency structure
+
+```
+bank.*  (domain)  ──depends-on──►  es.*  (framework)
+                                     │
+  bank.account ──────────────────►  es.decider-kit, es.schema
+  bank.transfer ─────────────────►  es.decider-kit, es.schema
+  bank.transfer-saga ────────────►  es.decider, es.saga, es.store
+  bank.account-projection ───────►  es.projection-kit, es.search, next.jdbc
+  bank.transfer-projection ──────►  es.projection-kit, next.jdbc
+  bank.system ───────────────────►  es.projection, es.projection-kit
+  bank.components ───────────────►  es.component, es.projection-kit
+```
+
+Key properties:
+
+- **`es.*` never imports `bank.*`** — the framework is completely domain-agnostic. Zero circular dependencies.
+- **Domain aggregates are pure** — `bank.account` and `bank.transfer` import only `es.decider-kit` and `es.schema`. No I/O, no JDBC, no database. They're portable and trivially testable.
+- **Projection handlers import `next.jdbc`** — `bank.account-projection` and `bank.transfer-projection` use JDBC directly in their SQL handlers. This is the one place domain code touches infrastructure.
+- **External libraries are confined** — Langohr (RabbitMQ) is only imported by `es.rabbitmq`. Migratus only by `es.migrations`. Malli only by `es.decider-kit`, `es.decider`, and `es.store`. Testcontainers only by `es.infra`.
+
+### What a hexagonal/onion architecture would look like
+
+In a hexagonal (ports & adapters) or onion architecture, the projection handlers wouldn't import `next.jdbc` directly. Instead:
+
+```
+bank.account-projection  ──►  ProjectionPort (protocol)  ◄──  JdbcProjectionAdapter
+```
+
+The domain would define an interface ("port") for writing read models, and an infrastructure layer would provide the JDBC implementation ("adapter"). This adds:
+
+1. A protocol/interface per projection operation
+2. An adapter namespace that implements the protocol with JDBC
+3. A wiring layer that connects adapters to ports at startup
+4. Indirection at every projection write
+
+### Why we don't do this
+
+**Projection handlers are inherently persistence-specific.** Their entire purpose is to write SQL into read model tables. An "abstraction" over `(jdbc/execute-one! tx ["UPDATE account_balances SET balance = balance + ? ..."])` would just wrap the same SQL in an extra function call. The handler IS the adapter — there's no meaningful domain logic to extract behind a port.
+
+**The Decider pattern already provides the important boundary.** The critical separation in event sourcing is between the pure domain (decide, evolve) and effectful infrastructure (load, store, project). This codebase has that separation cleanly:
+
+| Layer | Namespaces | Infrastructure? |
+|---|---|---|
+| Pure domain | `bank.account`, `bank.transfer` | None — no I/O, no DB |
+| Command handling | `es.decider`, `es.store` | JDBC, advisory locks |
+| Projections | `bank.*-projection`, `es.projection*` | JDBC |
+| Messaging | `es.outbox`, `es.rabbitmq`, `es.async-projection` | JDBC, Langohr |
+| Lifecycle | `es.component`, `es.infra` | Component, Testcontainers |
+
+The pure/effectful boundary is where the real value of layering comes from. The Decider pattern gives us this without ceremony.
+
+**Clojure idiom favours thin wrappers over deep abstraction layers.** `es.projection-kit/make-handler` and `make-query` are the abstraction boundary. Domain projection files declare handler specs as plain maps of `{event-type -> fn}`; the framework dispatches and provides context. This is a function-level contract, not an interface hierarchy.
+
+**The infrastructure is not swappable.** Hexagonal ports shine when you might replace Postgres with DynamoDB. This codebase is deeply Postgres-specific by design: BM25 search via ParadeDB, advisory locks via `pg_advisory_xact_lock`, `FOR UPDATE SKIP LOCKED`, `BIGSERIAL` sequences, JSONB payloads. Abstracting these behind ports would create a leaky abstraction that either exposes all the Postgres details or restricts the capabilities.
+
+**~15 namespaces don't need onion layers.** The overhead of defining protocols, adapters, and wiring for a codebase this size would add indirection without solving a real problem. You can read the entire dependency graph above and verify correctness by inspection.
+
+### When to add layers
+
+Adding more formal layers would be justified if:
+
+- **Multiple bounded contexts** — if an `orders.*` domain appeared alongside `bank.*`, you'd want clearer boundaries between them. Right now there's one domain, one framework.
+- **External API surface** — HTTP handlers should be a separate layer that calls domain logic, never infrastructure directly. The codebase doesn't have this yet.
+- **Non-Postgres targets** — if projections needed to write to Elasticsearch or DynamoDB, a port/adapter split per projection target would make sense.
+- **Team boundaries** — if separate teams owned the domain and infrastructure, formal interfaces between layers help establish contracts.
+
+For now, the discipline of "aggregates are pure, projections are SQL, framework doesn't know about domain" gives the important benefits without the ceremony.
 
 ## Operations
 

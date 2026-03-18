@@ -29,7 +29,19 @@
     :direction :higher-is-better}
    {:name      "projection/rebuild! throughput"
     :path      [:metrics :projection-rebuild-throughput :throughput-events-per-sec]
-    :direction :higher-is-better}])
+    :direction :higher-is-better}
+   {:name      "search (sync) p50 latency"
+    :path      [:metrics :search-sync-latency :p50-ms]
+    :direction :lower-is-better}
+   {:name      "search (sync) p95 latency"
+    :path      [:metrics :search-sync-latency :p95-ms]
+    :direction :lower-is-better}
+   {:name      "search (async read DB) p50 latency"
+    :path      [:metrics :search-async-latency :p50-ms]
+    :direction :lower-is-better}
+   {:name      "search (async read DB) p95 latency"
+    :path      [:metrics :search-async-latency :p95-ms]
+    :direction :lower-is-better}])
 
 (defn- env-double
   [k default]

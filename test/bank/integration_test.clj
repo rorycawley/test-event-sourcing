@@ -53,7 +53,7 @@
                          (jdbc/execute! support/*ds*
                                         ["SELECT id FROM schema_migrations ORDER BY id"]
                                         {:builder-fn rs/as-unqualified-kebab-maps}))]
-    (is (every? (set ids-before) [20260316233000 20260316233100]))
+    (is (every? (set ids-before) [1]))
     (is (nil? (migrations/migrate! support/*ds*)))
     (let [ids-after (mapv :id
                           (jdbc/execute! support/*ds*

@@ -9,6 +9,19 @@
    on the same last_global_sequence guards that projection handlers
    already implement. This makes duplicate processing safe (at-least-once).
 
+   Concurrency safety
+   ──────────────────
+   process-new-events! and rebuild! acquire a Postgres advisory lock
+   (on the read database, keyed by projection-name) to serialise access.
+   This prevents concurrent catch-ups from regressing the checkpoint and
+   protects rebuild! from racing with normal processing.
+
+   Global_sequence gaps
+   ────────────────────
+   global_sequence is a Postgres BIGSERIAL and may have gaps after
+   transaction rollbacks. Projections use it as a cursor (> checkpoint),
+   so gaps are harmless — they're simply skipped.
+
    Poison event handling
    ─────────────────────
    If a projection handler throws on a specific event, repeated catch-ups
@@ -24,6 +37,17 @@
             [es.rabbitmq :as rabbitmq]))
 
 ;; ——— Two-datasource projection ———
+
+(defn- acquire-projection-lock!
+  "Acquires a transaction-scoped advisory lock on the read database,
+   keyed by projection-name. Serialises all projection writes for a
+   given projection to prevent concurrent catch-ups from racing."
+  [tx projection-name]
+  (jdbc/execute-one! tx
+                     ["SELECT pg_advisory_xact_lock(
+                            ('x' || substr(md5(?), 1, 16))::bit(64)::bigint
+                          )"
+                      (str "projection:" projection-name)]))
 
 (defn- read-checkpoint
   "Reads the current checkpoint from the read database."
@@ -95,6 +119,10 @@
 (defn process-new-events!
   "Reads events from the event store and applies them to the read database.
 
+   Acquires an advisory lock on the read database (keyed by projection-name)
+   to serialise concurrent catch-ups. The checkpoint is read inside the
+   lock to prevent two callers from seeing the same checkpoint.
+
    event-store-ds: datasource for the event store (read-only access)
    read-db-ds:     datasource for the read model (read-write access)
    config:         {:projection-name, :read-model-tables, :handler}
@@ -104,40 +132,58 @@
    Returns the count of events processed."
   [event-store-ds read-db-ds {:keys [projection-name] :as config}
    & {:keys [batch-size] :or {batch-size default-batch-size}}]
-  (let [checkpoint  (read-checkpoint read-db-ds projection-name)
-        new-events  (read-new-events event-store-ds checkpoint batch-size)]
-    (when (seq new-events)
-      (jdbc/with-transaction [tx read-db-ds]
+  ;; Acquire advisory lock, read checkpoint, and apply events all within
+  ;; a single transaction on the read database. This prevents concurrent
+  ;; catch-ups from reading the same checkpoint and regressing it.
+  (jdbc/with-transaction [tx read-db-ds]
+    (acquire-projection-lock! tx projection-name)
+    (let [checkpoint (read-checkpoint tx projection-name)
+          new-events (read-new-events event-store-ds checkpoint batch-size)]
+      (when (seq new-events)
         (doseq [event new-events]
           (project-event! tx event config))
         (advance-checkpoint! tx projection-name
-                             (:global-sequence (peek new-events)))))
-    (count new-events)))
+                             (:global-sequence (peek new-events))))
+      (count new-events))))
 
 (defn- skip-poison-event!
   "Advances the checkpoint past a poison event that cannot be projected.
-   Called after max-consecutive-failures is reached."
-  [read-db-ds projection-name poison-event on-poison]
-  (on-poison poison-event)
-  (jdbc/with-transaction [tx read-db-ds]
-    (advance-checkpoint! tx projection-name
-                         (:global-sequence poison-event))))
+   Called after max-consecutive-failures is reached.
+   Uses the checkpoint value from the failed attempt to avoid re-reading
+   stale data."
+  [read-db-ds projection-name failed-checkpoint on-poison]
+  ;; Read the poison event (the one right after the failed checkpoint)
+  ;; and skip it by advancing the checkpoint.
+  (fn [event-store-ds]
+    (let [poison (first (read-new-events event-store-ds failed-checkpoint 1))]
+      (when poison
+        (on-poison poison)
+        (jdbc/with-transaction [tx read-db-ds]
+          (acquire-projection-lock! tx projection-name)
+          (advance-checkpoint! tx projection-name
+                               (:global-sequence poison)))
+        true))))
 
 (defn rebuild!
   "Destroys and rebuilds the read model from the complete event stream.
+
+   Acquires an advisory lock to prevent concurrent processing during rebuild.
 
    event-store-ds: datasource for the event store
    read-db-ds:     datasource for the read model
    config:         {:projection-name, :read-model-tables, :handler}"
   [event-store-ds read-db-ds {:keys [projection-name read-model-tables] :as config}]
+  ;; Delete read model and checkpoint under the advisory lock
   (jdbc/with-transaction [tx read-db-ds]
+    (acquire-projection-lock! tx projection-name)
     (doseq [table read-model-tables]
       (jdbc/execute-one! tx [(str "DELETE FROM " table)]))
     (jdbc/execute-one! tx
                        ["DELETE FROM projection_checkpoints
                          WHERE projection_name = ?"
                         projection-name]))
-  ;; Process in batches to avoid unbounded memory usage
+  ;; Process in batches. Each batch acquires the advisory lock via
+  ;; process-new-events!, so concurrent callers will wait.
   (loop [total 0]
     (let [n (process-new-events! event-store-ds read-db-ds config
                                  :batch-size default-batch-size)]
@@ -180,33 +226,42 @@
   (let [running           (atom true)
         catching-up?      (atom false)
         consecutive-fails (atom 0)
+        ;; Track the checkpoint at which the last failure occurred,
+        ;; so poison-skip doesn't need to re-read it (avoiding races).
+        last-failed-checkpoint (atom nil)
 
         do-catch-up!
         (fn []
           ;; Serialise catch-ups: if one is already running, skip.
           ;; This prevents concurrent catch-ups from the timer and
           ;; RabbitMQ messages from racing on the same events.
+          ;; The advisory lock in process-new-events! is the real
+          ;; serialisation mechanism; this atom avoids unnecessary
+          ;; lock contention.
           (when (compare-and-set! catching-up? false true)
             (try
               (let [n (process-new-events! event-store-ds read-db-ds config
                                            :batch-size batch-size)]
                 (when (pos? n)
-                  (reset! consecutive-fails 0))
+                  (reset! consecutive-fails 0)
+                  (reset! last-failed-checkpoint nil))
                 n)
               (catch Exception e
                 (on-error e)
-                (let [fails (swap! consecutive-fails inc)]
+                ;; Capture the checkpoint at which we failed so poison-skip
+                ;; can use it without re-reading (which could be stale).
+                (let [checkpoint (read-checkpoint read-db-ds
+                                                  (:projection-name config))
+                      fails (swap! consecutive-fails inc)]
+                  (reset! last-failed-checkpoint checkpoint)
                   (when (>= fails max-consecutive-failures)
-                    ;; Poison event: read the next event and skip it
                     (try
-                      (let [checkpoint (read-checkpoint read-db-ds
-                                                        (:projection-name config))
-                            poison     (first (read-new-events event-store-ds
-                                                               checkpoint 1))]
-                        (when poison
-                          (skip-poison-event! read-db-ds (:projection-name config)
-                                              poison on-poison)
-                          (reset! consecutive-fails 0)))
+                      (let [skip-fn (skip-poison-event!
+                                     read-db-ds (:projection-name config)
+                                     checkpoint on-poison)]
+                        (when (skip-fn event-store-ds)
+                          (reset! consecutive-fails 0)
+                          (reset! last-failed-checkpoint nil)))
                       (catch Exception skip-err
                         (on-error skip-err)))))
                 nil)
@@ -253,11 +308,17 @@
      :channel         ch}))
 
 (defn stop-consumer!
-  "Stops the consumer and catch-up timer."
+  "Stops the consumer and catch-up timer.
+   Waits up to 5 seconds for the catch-up timer to finish.
+   Logs a warning if the timer thread is still alive after the timeout."
   [{:keys [catch-up-timer running channel consumer-tag]}]
   (reset! running false)
   (try
     (rabbitmq/cancel! channel consumer-tag)
     (catch Exception _))
   (.interrupt ^Thread catch-up-timer)
-  (.join ^Thread catch-up-timer 5000))
+  (.join ^Thread catch-up-timer 5000)
+  (when (.isAlive ^Thread catch-up-timer)
+    (binding [*out* *err*]
+      (println "WARNING: catch-up timer thread did not stop within 5 seconds"
+               (.getName ^Thread catch-up-timer)))))

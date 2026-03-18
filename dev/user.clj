@@ -51,7 +51,7 @@
 ;; Step 1 — Start a throwaway Postgres
 ;; ═══════════════════════════════════════════════════
 ;;
-;; This pulls postgres:16-alpine via Testcontainers.
+;; This pulls paradedb/paradedb:latest via Testcontainers.
 ;; Takes ~5-10 s on first run (Docker image pull).
 
 (comment

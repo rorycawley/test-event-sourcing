@@ -1,3 +1,7 @@
+DROP TABLE IF EXISTS event_outbox;
+--;;
+DROP TABLE IF EXISTS transfer_status;
+--;;
 DROP TABLE IF EXISTS projection_checkpoints;
 --;;
 DROP TABLE IF EXISTS account_balances;

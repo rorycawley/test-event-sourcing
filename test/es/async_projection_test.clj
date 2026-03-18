@@ -209,6 +209,49 @@
   (is (= 6 (:count (get-counter *read-db-ds* "c-batch")))
       "After all 4 events: 0 + 1 + 2 + 3 = 6"))
 
+(deftest poison-event-skipped-after-max-failures
+  ;; Append a poison event (unknown type) followed by a valid event
+  (append-counter-events! "c-poison"
+                          [{:event-type "totally-unknown" :payload {}}])
+  (append-counter-events! "c-good-after-poison"
+                          [{:event-type "counter-created" :payload {}}
+                           {:event-type "counter-incremented" :payload {:delta 42}}])
+
+  ;; Simulate the consumer's catch-up loop with max-consecutive-failures = 3
+  (let [errors       (atom [])
+        poison-events (atom [])
+        do-catch-up! (fn []
+                       (try
+                         (async-proj/process-new-events! *event-store-ds* *read-db-ds*
+                                                         counter-config)
+                         (catch Exception e
+                           (swap! errors conj e)
+                           (throw e))))]
+
+    ;; Fail 3 times on the poison event
+    (dotimes [_ 3]
+      (try (do-catch-up!) (catch Exception _)))
+    (is (= 3 (count @errors))
+        "Should fail 3 times on the poison event")
+    (is (= 0 (checkpoint))
+        "Checkpoint should not advance past the poison event")
+
+    ;; Now skip the poison event explicitly using the two-step API:
+    ;; skip-poison-event! returns a function that takes event-store-ds
+    (let [failed-checkpoint (checkpoint)
+          skip-fn (#'async-proj/skip-poison-event!
+                   *read-db-ds* "counter-async" failed-checkpoint
+                   (fn [evt] (swap! poison-events conj evt)))]
+      (is (true? (skip-fn *event-store-ds*))))
+    (is (= 1 (count @poison-events))
+        "on-poison callback should have been called")
+    (is (= 1 (checkpoint))
+        "Checkpoint should advance past the poison event")
+
+    ;; Now catch-up should process the remaining valid events
+    (is (= 2 (do-catch-up!)))
+    (is (= 42 (:count (get-counter *read-db-ds* "c-good-after-poison"))))))
+
 (deftest event-store-and-read-db-are-independent
   ;; Verify the read DB doesn't have the events table
   (let [tables (jdbc/execute! *read-db-ds*

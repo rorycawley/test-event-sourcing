@@ -178,6 +178,38 @@
     (outbox/stop-poller! poller)
     (is (false? @(:running poller)))))
 
+(deftest hook-failure-rolls-back-events
+  (let [failing-hook (fn [_tx _seqs]
+                       (throw (ex-info "Hook exploded" {})))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Hook exploded"
+                          (store/append-events! *ds* "s-hook-fail" 0 nil
+                                                {:command-type :test :data {}}
+                                                [{:event-type "test-created" :payload {}}]
+                                                :on-events-appended failing-hook)))
+    (is (empty? (store/load-stream *ds* "s-hook-fail"))
+        "Events should be rolled back when hook throws")
+    (is (empty? (outbox-rows))
+        "No outbox rows should exist when hook throws")))
+
+(deftest publish-failure-does-not-mark-as-published
+  (let [hook     (outbox/make-outbox-hook)
+        call-count (atom 0)]
+    (append-test-events! "s-pub-fail"
+                         [{:event-type "test-created" :payload {}}]
+                         :on-events-appended hook)
+    ;; publish-fn throws on first call
+    (is (thrown? Exception
+                 (outbox/poll-and-publish! *ds*
+                                           (fn [_msg]
+                                             (swap! call-count inc)
+                                             (throw (ex-info "RabbitMQ down" {})))
+                                           100)))
+    ;; Row should still be unpublished
+    (let [rows (outbox-rows)]
+      (is (= 1 (count rows)))
+      (is (nil? (:published-at (first rows)))
+          "Outbox row should remain unpublished when publish-fn throws"))))
+
 (deftest poller-publishes-events-asynchronously
   (let [hook     (outbox/make-outbox-hook)
         messages (atom [])
