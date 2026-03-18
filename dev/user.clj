@@ -36,16 +36,22 @@
 ;; store     — event store (Pull and Push)
 ;; system    — composition root (wires projections)
 
-(require '[es.infra                   :as infra]
-         '[es.migrations              :as migrations]
-         '[es.store                   :as store]
-         '[es.decider                 :as decider]
-         '[bank.account               :as account]
-         '[bank.system                :as system]
-         '[bank.account-projection    :as account-projection]
-         '[bank.transfer-projection   :as transfer-projection]
-         '[bank.transfer              :as transfer]
-         '[bank.transfer-saga         :as saga])
+(require '[es.infra                           :as infra]
+         '[es.migrations                      :as migrations]
+         '[es.store                           :as store]
+         '[es.decider                         :as decider]
+         '[es.outbox                          :as outbox]
+         '[com.stuartsierra.component         :as component]
+         '[bank.account                       :as account]
+         '[bank.system                        :as system]
+         '[bank.components                    :as bank-components]
+         '[bank.account-projection            :as account-projection]
+         '[bank.transfer-projection           :as transfer-projection]
+         '[bank.transfer                      :as transfer]
+         '[bank.transfer-saga                 :as saga]
+         '[notification.notification          :as notification]
+         '[notification.notification-projection :as notification-projection]
+         '[system                             :as full-system])
 
 ;; ═══════════════════════════════════════════════════
 ;; Step 1 — Start a throwaway Postgres
@@ -385,6 +391,60 @@
     (catch clojure.lang.ExceptionInfo e
       (ex-data e)))
   ;; => {:error/type :domain/same-account-transfer, :account "a"}
+
+  ;; ═══════════════════════════════════════════════════
+  ;; Exploring the Notification Decider
+  ;; ═══════════════════════════════════════════════════
+  ;;
+  ;; The notification aggregate tracks notification lifecycle.
+  ;; It does NOT send emails — it's a pure state machine.
+  ;; A separate delivery worker would handle the actual send.
+
+  notification/decider
+  ;; => {:initial-state {:status :not-found, :retry-count 0}
+  ;;     :decide        #function[...]
+  ;;     :evolve        #function[...]}
+
+  ;; Request a notification — pure, no database:
+  (notification/decide {:command-type :request-notification
+                        :data {:notification-type "welcome-email"
+                               :recipient-id      "acct-1"
+                               :payload           {:message "Hello!"}}}
+                       {:status :not-found :retry-count 0})
+  ;; => [{:event-type "notification-requested", :payload {...}}]
+
+  ;; Evolve through a full lifecycle — pure data:
+  (decider/evolve-state notification/decider
+                        [{:event-type "notification-requested" :event-version 1
+                          :payload {:notification-type "welcome-email"
+                                    :recipient-id      "acct-1"
+                                    :payload           {:message "Hello!"}}}
+                         {:event-type "notification-sent" :event-version 1
+                          :payload {}}])
+  ;; => {:status :sent, :retry-count 0,
+  ;;     :notification-type "welcome-email", :recipient-id "acct-1", ...}
+
+  ;; Retry lifecycle — three failures abandon the notification:
+  (decider/evolve-state notification/decider
+                        [{:event-type "notification-requested" :event-version 1
+                          :payload {:notification-type "alert"
+                                    :recipient-id      "acct-1"
+                                    :payload           {:amount 10000}}}
+                         {:event-type "notification-failed" :event-version 1
+                          :payload {:reason "SMTP timeout"}}
+                         {:event-type "notification-failed" :event-version 1
+                          :payload {:reason "SMTP timeout"}}
+                         {:event-type "notification-abandoned" :event-version 1
+                          :payload {:reason "SMTP timeout"}}])
+  ;; => {:status :failed, :retry-count 3, ...}
+
+  ;; Business rule: can't mark sent if already failed:
+  (try
+    (notification/decide {:command-type :mark-sent :data {}}
+                         {:status :failed :retry-count 3})
+    (catch clojure.lang.ExceptionInfo e
+      (ex-data e)))
+  ;; => {:error/type :domain/notification-not-pending, :status :failed}
   )
 
 ;; ═══════════════════════════════════════════════════
@@ -403,10 +463,6 @@
 ;; Missed messages are recovered by periodic catch-up.
 
 (comment
-
-  (require '[com.stuartsierra.component :as component]
-           '[bank.components :as bank-components]
-           '[es.outbox :as outbox])
 
   ;; ── Start the full system ──────────────────────
 
@@ -470,4 +526,68 @@
 
   ;; ── Stop the system ────────────────────────────
 
+  (component/stop system))
+
+;; ═══════════════════════════════════════════════════
+;; Full System with Notification Module
+;; ═══════════════════════════════════════════════════
+;;
+;; The full system includes everything above PLUS:
+;;   - Notification database (separate Postgres)
+;;   - Notification consumers (reactor: integration event → command)
+;;   - Notification projector (aggregate events → read model)
+;;
+;; Flow: Bank command → domain event → integration event (outbox)
+;;       → RabbitMQ → notification consumer → reactor
+;;       → notification aggregate (event store) → projector
+;;       → notifications read model (notification DB)
+
+(comment
+
+  ;; ── Start the full system (4 containers) ─────
+  (def system (component/start (full-system/dev-full-system)))
+
+  (def event-ds (get-in system [:event-store-ds :datasource]))
+  (def read-ds  (get-in system [:read-db-ds :datasource]))
+  (def notif-ds (get-in system [:notification-db :datasource]))
+
+  ;; ── Send commands with integration event outbox hook ──
+  (def outbox-hook (full-system/make-outbox-hook))
+
+  (decider/handle-with-retry! event-ds account/decider
+                              {:command-type    :open-account
+                               :stream-id       "account-1"
+                               :idempotency-key "open-1"
+                               :data            {:owner "Alice"}}
+                              :on-events-appended outbox-hook)
+
+  (decider/handle-with-retry! event-ds account/decider
+                              {:command-type    :deposit
+                               :stream-id       "account-1"
+                               :idempotency-key "dep-15000"
+                               :data            {:amount 15000}}
+                              :on-events-appended outbox-hook)
+
+  ;; Wait a moment for the async pipeline:
+  ;; bank event → outbox → RabbitMQ → notification consumer
+  ;; → reactor → notification aggregate → projector → read model
+
+  ;; Check account balance (bank read model):
+  (account-projection/get-balance read-ds "account-1")
+
+  ;; Check notification aggregates (event store):
+  (store/load-stream event-ds "notification-welcome-email-1")
+  (store/load-stream event-ds "notification-large-deposit-alert-2")
+
+  ;; Check notification read model (notification DB):
+  (notification-projection/get-notification notif-ds "notification-welcome-email-1")
+  ;; => {:stream-id "notification-welcome-email-1",
+  ;;     :notification-type "welcome-email",
+  ;;     :recipient-id "account-1",
+  ;;     :status "pending", ...}
+
+  (notification-projection/get-notification notif-ds "notification-large-deposit-alert-2")
+  ;; => {:notification-type "large-deposit-alert", :status "pending", ...}
+
+  ;; ── Stop the system ────────────────────────────
   (component/stop system))

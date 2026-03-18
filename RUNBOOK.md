@@ -137,12 +137,15 @@ unknown) would block the entire projector on unrecognized events.
 
 ### What ends up on the DLQ
 
-Currently: nothing in normal operation. Messages are nacked with `requeue=true`,
-so they re-enter the main queue. The DLQ (`<queue>.dlq`) is infrastructure for
-future use (e.g., message TTL, explicit rejection).
+Currently: nothing in normal operation. Messages are always ACKed regardless
+of whether the catch-up succeeds or fails. The projector relies on its own
+checkpoint-based catch-up (timer + RabbitMQ notifications) for retry, not
+RabbitMQ redelivery. The DLQ (`<queue>.dlq`) is infrastructure for future use
+(e.g., message TTL, explicit rejection).
 
-Since messages are notifications (not event carriers), losing a message is
-harmless — the catch-up timer will pick up any missed events within 30 seconds.
+Since messages are notifications (not event carriers), losing or ACKing a
+message is harmless — the catch-up timer will pick up any missed events
+within 30 seconds.
 
 ### Inspecting the DLQ
 

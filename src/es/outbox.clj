@@ -1,12 +1,19 @@
 (ns es.outbox
-  "Transactional outbox for reliable event publishing.
+  "Transactional outbox for reliable integration event publishing.
 
-   Events are written to the event_outbox table in the same transaction
-   as the event store append. A simple polling loop reads unpublished
-   rows and publishes them to RabbitMQ.
+   Domain events are written to the events table. The outbox hook
+   transforms selected domain events into integration events and
+   stores them in the event_outbox table (same transaction). A
+   polling loop reads unpublished rows and publishes them to RabbitMQ.
 
-   This guarantees at-least-once delivery: if the process crashes between
-   append and publish, the outbox row survives and the poller retries.
+   Integration events are the module's public API — they decouple
+   the publishing module from consumers. Consumers see only integration
+   events, never raw domain events. Not all domain events need to
+   become integration events; the mapper controls which are published.
+
+   This guarantees at-least-once delivery: if the process crashes
+   between append and publish, the outbox row survives and the
+   poller retries.
 
    Ordering
    ────────
@@ -18,88 +25,119 @@
             [next.jdbc.result-set :as rs]
             [clojure.data.json :as json]
             [clojure.tools.logging :as log]
-            [es.store :as store]))
+            [es.store :as store])
+  (:import [org.postgresql.util PGobject]))
 
 ;; ——— Outbox writing (called within store transaction) ———
 
 (defn record!
-  "Records a global_sequence in the outbox. Called within the same
-   transaction as append-events!."
-  [tx global-sequence]
+  "Records an integration event in the outbox. Called within the same
+   transaction as append-events!.
+
+   global-sequence: the event's global_sequence (for ordering)
+   message:         the integration event map to publish"
+  [tx global-sequence message]
   (jdbc/execute-one! tx
-                     ["INSERT INTO event_outbox (global_sequence) VALUES (?)"
-                      global-sequence]))
+                     ["INSERT INTO event_outbox (global_sequence, message)
+                       VALUES (?, ?::jsonb)"
+                      global-sequence
+                      (json/write-str message)]))
+
+(defn- raw-event-mapper
+  "Default mapper that publishes raw event data as-is.
+   Used when no integration event mapper is provided."
+  [event]
+  {:global-sequence (:global-sequence event)
+   :stream-id       (:stream-id event)
+   :event-type      (:event-type event)
+   :event-version   (:event-version event)
+   :payload         (:payload event)})
 
 (defn make-outbox-hook
-  "Returns an on-events-appended hook function suitable for
-   passing to es.store/append-events! or es.decider/handle!.
+  "Returns an on-events-appended hook that records integration events.
+
+   event->message: (fn [event-row] integration-event-map-or-nil)
+     Transforms a domain event into an integration event for publishing.
+     Return nil to skip publishing for that event.
+
+   The hook re-reads newly appended events within the same transaction
+   to build integration events. This runs inside the append transaction,
+   so the event data is guaranteed to be visible.
 
    Usage:
+     ;; With integration event mapper:
+     (store/append-events! ds stream-id version key cmd events
+       :on-events-appended (outbox/make-outbox-hook my-mapper))
+
+     ;; With default raw mapper (backward compat):
      (store/append-events! ds stream-id version key cmd events
        :on-events-appended (outbox/make-outbox-hook))"
-  []
-  (fn [tx global-sequences]
-    (doseq [gs global-sequences]
-      (record! tx gs))))
+  ([] (make-outbox-hook raw-event-mapper))
+  ([event->message]
+   (fn [tx global-sequences]
+     (doseq [gs global-sequences]
+       (let [event (-> (jdbc/execute-one! tx
+                                          ["SELECT global_sequence, stream_id,
+                                                   event_type, event_version, payload
+                                            FROM events
+                                            WHERE global_sequence = ?"
+                                           gs]
+                                          {:builder-fn rs/as-unqualified-kebab-maps})
+                       (update :payload store/<-pgobject))
+             message (event->message event)]
+         (when message
+           (record! tx gs message)))))))
 
 ;; ——— Outbox polling (reads unpublished, publishes to RabbitMQ) ———
 
+(defn- message->str
+  "Converts a message column value (PGobject JSONB) to a JSON string."
+  [message-value]
+  (if (instance? PGobject message-value)
+    (.getValue ^PGobject message-value)
+    (json/write-str message-value)))
+
 (defn poll-and-publish!
-  "Single poll cycle: reads unpublished outbox rows, loads the
-   corresponding events, publishes each to RabbitMQ, marks as published.
+  "Single poll cycle: reads unpublished outbox rows and publishes
+   their stored integration event messages to RabbitMQ.
 
    Each row is published and marked individually: if publish-fn throws
    on row N, rows 1..N-1 are already committed (not rolled back).
-   This avoids re-publishing events that were already sent to RabbitMQ.
 
    The SELECT uses FOR UPDATE SKIP LOCKED to avoid contention between
-   concurrent pollers. However, publish happens after the SELECT
-   transaction releases its locks, so a second poller can select and
-   publish the same row before the first poller's UPDATE runs. The
-   UPDATE's published_at IS NULL guard prevents double-marking but
-   not double-publishing. Consumers must be idempotent.
+   concurrent pollers. The UPDATE's published_at IS NULL guard prevents
+   double-marking but not double-publishing. Consumers must be idempotent.
 
    Returns the count of events published."
   [ds publish-fn batch-size]
   (let [rows (jdbc/with-transaction [tx ds]
                (jdbc/execute! tx
-                              ["SELECT o.id, o.global_sequence,
-                                       e.stream_id, e.event_type,
-                                       e.event_version, e.payload
+                              ["SELECT o.id, o.global_sequence, o.message
                                 FROM event_outbox o
-                                JOIN events e ON e.global_sequence = o.global_sequence
                                 WHERE o.published_at IS NULL
                                 ORDER BY o.id ASC
                                 LIMIT ?
                                 FOR UPDATE OF o SKIP LOCKED"
                                batch-size]
                               {:builder-fn rs/as-unqualified-kebab-maps}))
-        ;; Publish outside the SELECT transaction, then mark each row
-        ;; in its own transaction so that a failure on row N doesn't
-        ;; roll back the already-published rows 1..N-1.
-        ;; Each mark transaction uses a published_at IS NULL guard
-        ;; so that if two pollers select the same row, the second
-        ;; poller's UPDATE is a no-op. Note: the publish above can
-        ;; still produce duplicates — consumers must be idempotent.
         published
         (reduce
          (fn [acc row]
-           (let [payload (store/<-pgobject (:payload row))
-                 message (json/write-str
-                          {:global-sequence (:global-sequence row)
-                           :stream-id       (:stream-id row)
-                           :event-type      (:event-type row)
-                           :event-version   (:event-version row)
-                           :payload         payload})]
-             (publish-fn message)
-             (jdbc/with-transaction [tx ds]
-               (jdbc/execute-one! tx
-                                  ["UPDATE event_outbox
-                                    SET published_at = NOW()
-                                    WHERE id = ?
-                                      AND published_at IS NULL"
-                                   (:id row)]))
-             (inc acc)))
+           (if (nil? (:message row))
+             (do (log/warn "Skipping outbox row with NULL message"
+                           {:id (:id row)
+                            :global-sequence (:global-sequence row)})
+                 acc)
+             (let [message (message->str (:message row))]
+               (publish-fn message)
+               (jdbc/with-transaction [tx ds]
+                 (jdbc/execute-one! tx
+                                    ["UPDATE event_outbox
+                                      SET published_at = NOW()
+                                      WHERE id = ?
+                                        AND published_at IS NULL"
+                                     (:id row)]))
+               (inc acc))))
          0
          rows)]
     published))
@@ -113,7 +151,7 @@
    opts:
      :poll-interval-ms — sleep between polls (default 100)
      :batch-size       — max events per poll (default 100)
-     :on-error         — (fn [exception]) error handler (default: print)
+     :on-error         — (fn [exception]) error handler (default: log)
 
    Returns {:thread Thread, :running (atom true)}."
   [ds publish-fn & {:keys [poll-interval-ms batch-size on-error]

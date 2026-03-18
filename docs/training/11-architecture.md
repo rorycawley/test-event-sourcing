@@ -600,6 +600,19 @@ RabbitMQ messages provide low-latency wake-ups, but they can be lost (broker res
     (do-catch-up!)))
 ```
 
+### Why projectors don't need an inbox
+
+The **transactional inbox** pattern solves idempotent, exactly-once processing for consumers that apply event data directly from the message. The consumer writes the inbound message to a local inbox table inside the same transaction as its side effects, using message ID deduplication.
+
+Our projectors don't need this because the checkpoint *is* the inbox:
+
+- `process-new-events!` reads from the event store where `global_sequence > checkpoint`
+- The checkpoint advances in the same transaction as the projection write
+- Duplicate RabbitMQ deliveries just trigger a catch-up that finds zero new events
+- The projector never reads from the message payload at all
+
+An inbox would become relevant for consumers that **act on the message content directly** — for example, a notification service that sends an email on `account-opened`. That consumer can't go back to the event store and replay; it needs to know "have I already processed this specific message?" to avoid sending duplicate emails. That's the inbox use case.
+
 ---
 
 ## Poison Event Handling
@@ -725,7 +738,7 @@ Because every step is idempotent, re-execution is always safe. A step that was a
 
 ### Trade-off: saga events in RabbitMQ
 
-The saga doesn't use the outbox hook (the saga coordinator calls `decider/handle!`, not `handle-with-retry!` with an outbox hook). This means transfer events reach async projectors via the catch-up timer, not RabbitMQ notifications. Transfer status projections may lag by up to the catch-up interval (default 30s). For a bank transfer that takes 50ms to execute, this is acceptable.
+The saga supports an optional `:on-events-appended` hook. When the outbox hook is passed (e.g. `(saga/execute! ds id from to amount :on-events-appended outbox-hook)`), every saga step — account debits/credits and transfer progress events — flows through the outbox → RabbitMQ pipeline, giving real-time projection updates. Without the hook, transfer events reach async projectors only via the catch-up timer (default 30s).
 
 ---
 

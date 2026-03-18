@@ -30,6 +30,8 @@
    - Consecutive failures are only counted when the same event fails
    - Infrastructure failures (DB outages, connection errors) do NOT count
      toward the poison threshold — only handler-specific errors do
+   - Fatal JVM Errors (OutOfMemoryError, StackOverflowError etc.) propagate
+     immediately and are never classified as handler failures
    - After :max-consecutive-failures (default 5), skip-poison-event!
      processes any valid events before the poison, then skips the poison
    - Skipped events are logged via :on-poison for alerting/investigation
@@ -139,14 +141,14 @@
         (doseq [event new-events]
           (try
             (project-event! tx event config)
-            (catch Throwable t
+            (catch Exception e
               (throw (ex-info (str "Projection handler failed on event "
                                    (:global-sequence event))
                               {:global-sequence (:global-sequence event)
                                :event-type      (:event-type event)
                                :projection-name projection-name
                                :handler-error   true}
-                              t)))))
+                              e)))))
         (advance-checkpoint! tx projection-name
                              (:global-sequence (peek new-events))))
       (count new-events))))
@@ -215,6 +217,48 @@
         (recur (+ total n))
         total))))
 
+;; ——— Failure tracker ———
+
+(defn make-failure-tracker
+  "Creates a failure tracker for poison event detection.
+
+   Encapsulates the state machine that counts consecutive handler failures
+   on the same event and signals when the poison threshold is reached.
+
+   max-consecutive-failures: skip poison after this many failures (default 5)
+
+   Returns a map of functions:
+     :record-success! — call after a successful catch-up (resets counter)
+     :record-failure! — call with ex-data from a failed catch-up; returns
+                         {:action :skip-poison :global-sequence gs} when
+                         threshold is reached, nil otherwise
+     :reset!          — call after a poison event is successfully skipped"
+  [max-consecutive-failures]
+  (let [consecutive-fails (atom 0)
+        last-failed-gs    (atom nil)]
+    {:record-success!
+     (fn []
+       (when (pos? @consecutive-fails)
+         (reset! consecutive-fails 0)
+         (reset! last-failed-gs nil)))
+
+     :record-failure!
+     (fn [ex-data-map]
+       (when (:handler-error ex-data-map)
+         (let [failing-gs (:global-sequence ex-data-map)
+               fails      (if (= failing-gs @last-failed-gs)
+                            (swap! consecutive-fails inc)
+                            (do (reset! consecutive-fails 1)
+                                (reset! last-failed-gs failing-gs)
+                                1))]
+           (when (>= fails max-consecutive-failures)
+             {:action :skip-poison :global-sequence failing-gs}))))
+
+     :reset!
+     (fn []
+       (reset! consecutive-fails 0)
+       (reset! last-failed-gs nil))}))
+
 ;; ——— RabbitMQ consumer ———
 
 (defn make-consumer
@@ -247,64 +291,39 @@
                                    {:projection      (:projection-name config)
                                     :global-sequence  (:global-sequence event)
                                     :event-type       (:event-type event)}))}}]
-  (let [running           (atom true)
-        catching-up?      (atom false)
-        consecutive-fails (atom 0)
-        ;; Track the global_sequence of the event whose handler failed,
-        ;; so poison-skip targets the right event (not earlier ones in the batch).
-        last-failed-global-sequence (atom nil)
+  (let [running      (atom true)
+        catching-up? (atom false)
+        tracker      (make-failure-tracker max-consecutive-failures)
 
         do-catch-up!
         (fn []
           ;; Serialise catch-ups: if one is already running, skip.
-          ;; This prevents concurrent catch-ups from the timer and
-          ;; RabbitMQ messages from racing on the same events.
           ;; The advisory lock in process-new-events! is the real
           ;; serialisation mechanism; this atom avoids unnecessary
           ;; lock contention.
           (when (compare-and-set! catching-up? false true)
             (try
-              ;; Loop until all pending events are drained. A single
-              ;; process-new-events! call is capped at batch-size, so
-              ;; if the projector is far behind we must loop to catch up
-              ;; fully — otherwise recovery is limited to one batch per
-              ;; wake-up signal.
+              ;; Drain all pending batches. A single process-new-events!
+              ;; call is capped at batch-size, so we loop until drained.
               (let [total (loop [total 0]
                             (let [n (process-new-events! event-store-ds read-db-ds config
                                                          :batch-size batch-size)]
                               (if (< n batch-size)
                                 (+ total n)
                                 (recur (+ total n)))))]
-                ;; Reset on any successful catch-up, not just when events
-                ;; were processed. An empty poll still proves the projection
-                ;; is healthy — prior transient failures should not accumulate
-                ;; across successful empty polls.
-                (when (pos? @consecutive-fails)
-                  (reset! consecutive-fails 0)
-                  (reset! last-failed-global-sequence nil))
+                ((:record-success! tracker))
                 total)
               (catch Exception e
                 (on-error e)
-                ;; Only count toward poison threshold when a specific event's
-                ;; handler failed. Infrastructure failures (DB outages, etc.)
-                ;; should NOT advance the checkpoint or skip events.
-                (let [ed (ex-data e)
-                      failing-gs (:global-sequence ed)]
-                  (when (:handler-error ed)
-                    (let [fails (if (= failing-gs @last-failed-global-sequence)
-                                  (swap! consecutive-fails inc)
-                                  (do (reset! consecutive-fails 1)
-                                      (reset! last-failed-global-sequence failing-gs)
-                                      1))]
-                      (when (>= fails max-consecutive-failures)
-                        (try
-                          (when (skip-poison-event!
-                                 event-store-ds read-db-ds config
-                                 failing-gs on-poison)
-                            (reset! consecutive-fails 0)
-                            (reset! last-failed-global-sequence nil))
-                          (catch Exception skip-err
-                            (on-error skip-err)))))))
+                (when-let [{:keys [global-sequence]}
+                           ((:record-failure! tracker) (ex-data e))]
+                  (try
+                    (when (skip-poison-event!
+                           event-store-ds read-db-ds config
+                           global-sequence on-poison)
+                      ((:reset! tracker)))
+                    (catch Exception skip-err
+                      (on-error skip-err))))
                 nil)
               (finally
                 (reset! catching-up? false)))))
@@ -353,19 +372,46 @@
     {:consumer-tag    consumer-tag
      :catch-up-timer  catch-up-timer
      :running         running
+     :catching-up?    catching-up?
      :channel         ch}))
 
+(def ^:private shutdown-timeout-ms
+  "Maximum time to wait for in-flight catch-up work during shutdown."
+  5000)
+
 (defn stop-consumer!
-  "Stops the consumer and catch-up timer.
-   Waits up to 5 seconds for the catch-up timer to finish.
-   Logs a warning if the timer thread is still alive after the timeout."
-  [{:keys [catch-up-timer running channel consumer-tag]}]
+  "Stops the consumer and catch-up timer, waiting for in-flight work.
+
+   Shutdown sequence:
+   1. Signal the consumer to stop accepting new work
+   2. Cancel the RabbitMQ consumer (no new deliveries)
+   3. Wait for any in-flight catch-up to complete (avoids ACK on closed channel)
+   4. Stop the catch-up timer thread
+
+   Waits up to 5 seconds for in-flight work and the timer thread.
+   Logs a warning if either exceeds the timeout."
+  [{:keys [catch-up-timer running catching-up? channel consumer-tag]}]
+  ;; 1. Signal stop — no new catch-ups will start
   (reset! running false)
+  ;; 2. Cancel consumer — no new deliveries will arrive
   (try
     (rabbitmq/cancel! channel consumer-tag)
     (catch Exception _))
+  ;; 3. Wait for in-flight catch-up to finish before closing the channel.
+  ;;    This prevents AlreadyClosedException from ACK on a closed channel.
+  (let [deadline (+ (System/currentTimeMillis) shutdown-timeout-ms)]
+    (loop []
+      (when (and @catching-up?
+                 (< (System/currentTimeMillis) deadline))
+        (Thread/sleep 50)
+        (recur)))
+    (when @catching-up?
+      (log/warn "In-flight catch-up did not complete within shutdown timeout"
+                {:projection (when catch-up-timer
+                               (.getName ^Thread catch-up-timer))})))
+  ;; 4. Stop the periodic catch-up timer
   (.interrupt ^Thread catch-up-timer)
-  (.join ^Thread catch-up-timer 5000)
+  (.join ^Thread catch-up-timer shutdown-timeout-ms)
   (when (.isAlive ^Thread catch-up-timer)
-    (log/warn "Catch-up timer thread did not stop within 5 seconds"
+    (log/warn "Catch-up timer thread did not stop within timeout"
               {:thread (.getName ^Thread catch-up-timer)})))

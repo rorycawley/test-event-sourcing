@@ -96,6 +96,10 @@
 (defrecord Migrator [migration-dir
                      ;; injected dependency
                      datasource]
+  ;; NOTE: Runs migrations on component start, which is convenient for
+  ;; development and testing. Production deployments should run migrations
+  ;; out of band (e.g. as a separate CLI command or CI step) and replace
+  ;; this component with a no-op.
   component/Lifecycle
   (start [this]
     (let [ds (:datasource datasource)]

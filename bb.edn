@@ -5,7 +5,7 @@
 
   smoke
   {:doc "Require all src + dev namespaces (quick compile/sanity check)"
-   :task (shell "clj" "-M" "-e"
+   :task (shell "clj" "-M:dev" "-e"
                 "(run! require (mapcat (fn [d] (->> (file-seq (clojure.java.io/file d)) (filter #(.endsWith (.getName %) \".clj\")) (map #(-> (.getPath %) (clojure.string/replace d \"\") (subs 1) (clojure.string/replace \"/\" \".\") (clojure.string/replace \"_\" \"-\") (clojure.string/replace \".clj\" \"\") symbol)))) [\"src\" \"dev\"]))")}
 
   lint

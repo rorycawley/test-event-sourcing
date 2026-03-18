@@ -35,11 +35,22 @@
             [bank.account-projection :as account-projection]
             [bank.transfer-projection :as transfer-projection]))
 
+(defn- merge-handler-specs
+  "Merges handler-specs maps, failing fast on duplicate event-type keys.
+   Silent merge-overwrites would cause one projection handler to vanish."
+  [& specs-maps]
+  (let [all-keys (mapcat keys specs-maps)
+        dupes    (for [[k freq] (frequencies all-keys) :when (> freq 1)] k)]
+    (when (seq dupes)
+      (throw (ex-info "Duplicate event-type keys in projection handler-specs"
+                      {:duplicate-keys (vec dupes)}))))
+  (apply merge specs-maps))
+
 (def ^:private combined-handler
   "Merged handler built from all domain projection handler-specs."
   (kit/make-handler
-   (merge account-projection/handler-specs
-          transfer-projection/handler-specs)))
+   (merge-handler-specs account-projection/handler-specs
+                        transfer-projection/handler-specs)))
 
 (def projection-config
   "Configuration for the bank domain's main projection."

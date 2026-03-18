@@ -19,7 +19,8 @@
    merges them and passes the combined handler to the projection config."
   (:require [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [clojure.tools.logging :as log]))
 
 ;; ——— Identifier validation ———
 
@@ -85,7 +86,11 @@
     (let [handler (get handler-specs event-type)]
       (if handler
         (handler tx event context)
-        (when-not skip-unknown?
+        (if skip-unknown?
+          (log/debug "Skipping unknown event type"
+                     {:projection-name (:projection-name context)
+                      :event-type      event-type
+                      :global-sequence (:global-sequence event)})
           (throw (ex-info "Unknown event type for projection"
                           {:projection-name (:projection-name context)
                            :event-type      event-type

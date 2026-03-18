@@ -336,3 +336,68 @@
         "Read DB should not have the events table")
     (is (not (contains? table-names "idempotency_keys"))
         "Read DB should not have the idempotency_keys table")))
+
+;; ═══════════════════════════════════════════════════
+;; Failure tracker (pure, no DB/RabbitMQ needed)
+;; ═══════════════════════════════════════════════════
+
+(deftest failure-tracker-ignores-infrastructure-errors
+  (let [tracker (async-proj/make-failure-tracker 3)]
+    (is (nil? ((:record-failure! tracker) {:some "infra-error"}))
+        "Non-handler errors should not count toward poison threshold")
+    (is (nil? ((:record-failure! tracker) {:some "infra-error"})))
+    (is (nil? ((:record-failure! tracker) {:some "infra-error"})))
+    (is (nil? ((:record-failure! tracker) {:some "infra-error"}))
+        "Even after many infra errors, no poison signal")))
+
+(deftest failure-tracker-counts-handler-errors
+  (let [tracker (async-proj/make-failure-tracker 3)]
+    (is (nil? ((:record-failure! tracker)
+               {:handler-error true :global-sequence 42})))
+    (is (nil? ((:record-failure! tracker)
+               {:handler-error true :global-sequence 42})))
+    (is (= {:action :skip-poison :global-sequence 42}
+           ((:record-failure! tracker)
+            {:handler-error true :global-sequence 42}))
+        "Third consecutive failure on same event triggers skip")))
+
+(deftest failure-tracker-resets-on-success
+  (let [tracker (async-proj/make-failure-tracker 3)]
+    ;; Two failures, then success
+    ((:record-failure! tracker) {:handler-error true :global-sequence 42})
+    ((:record-failure! tracker) {:handler-error true :global-sequence 42})
+    ((:record-success! tracker))
+    ;; Counter should be reset — need 3 more to trigger
+    (is (nil? ((:record-failure! tracker)
+               {:handler-error true :global-sequence 42})))
+    (is (nil? ((:record-failure! tracker)
+               {:handler-error true :global-sequence 42})))
+    (is (= {:action :skip-poison :global-sequence 42}
+           ((:record-failure! tracker)
+            {:handler-error true :global-sequence 42})))))
+
+(deftest failure-tracker-resets-on-different-event
+  (let [tracker (async-proj/make-failure-tracker 3)]
+    ;; Two failures on event 42
+    ((:record-failure! tracker) {:handler-error true :global-sequence 42})
+    ((:record-failure! tracker) {:handler-error true :global-sequence 42})
+    ;; Different event resets the counter
+    (is (nil? ((:record-failure! tracker)
+               {:handler-error true :global-sequence 99})))
+    (is (nil? ((:record-failure! tracker)
+               {:handler-error true :global-sequence 99})))
+    (is (= {:action :skip-poison :global-sequence 99}
+           ((:record-failure! tracker)
+            {:handler-error true :global-sequence 99}))
+        "Third failure on event 99 triggers skip")))
+
+(deftest failure-tracker-reset-clears-state
+  (let [tracker (async-proj/make-failure-tracker 2)]
+    ((:record-failure! tracker) {:handler-error true :global-sequence 42})
+    ((:reset! tracker))
+    ;; After explicit reset, need full count again
+    (is (nil? ((:record-failure! tracker)
+               {:handler-error true :global-sequence 42})))
+    (is (= {:action :skip-poison :global-sequence 42}
+           ((:record-failure! tracker)
+            {:handler-error true :global-sequence 42})))))

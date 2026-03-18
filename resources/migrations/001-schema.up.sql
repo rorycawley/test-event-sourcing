@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS transfer_status (
 CREATE TABLE IF NOT EXISTS event_outbox (
   id              BIGSERIAL PRIMARY KEY,
   global_sequence BIGINT NOT NULL UNIQUE,
+  message         JSONB,
   published_at    TIMESTAMPTZ
 );
 --;;

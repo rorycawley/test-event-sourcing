@@ -62,11 +62,17 @@
 
 (deftest record-writes-outbox-row
   (jdbc/with-transaction [tx *ds*]
-    (outbox/record! tx 42))
+    ;; Insert a dummy event first so the FK-like relationship holds
+    (jdbc/execute-one! tx
+                       ["INSERT INTO events (id, stream_id, stream_sequence, event_type, payload)
+                         VALUES (?, 'test', 1, 'test', '{}'::jsonb)"
+                        (store/uuid-v7)])
+    (outbox/record! tx 1 {:event-type "test" :global-sequence 1}))
   (let [rows (outbox-rows)]
     (is (= 1 (count rows)))
-    (is (= 42 (:global-sequence (first rows))))
-    (is (nil? (:published-at (first rows))))))
+    (is (= 1 (:global-sequence (first rows))))
+    (is (nil? (:published-at (first rows))))
+    (is (some? (:message (first rows))))))
 
 ;; ═══════════════════════════════════════════════════
 ;; make-outbox-hook tests
@@ -112,7 +118,7 @@
                                       100)]
       (is (= 2 n))
       (is (= 2 (count @messages)))
-      ;; Verify message format
+      ;; Verify message format — now reads from stored message column
       (let [parsed (json/read-str (first @messages) :key-fn keyword)]
         (is (= 1 (:global-sequence parsed)))
         (is (= "s-3" (:stream-id parsed)))
@@ -167,6 +173,32 @@
         (is (= 3 (count @messages)))))))
 
 ;; ═══════════════════════════════════════════════════
+;; Integration event mapper tests
+;; ═══════════════════════════════════════════════════
+
+(deftest outbox-hook-with-custom-mapper
+  (let [mapper (fn [event]
+                 (when (= "test-created" (:event-type event))
+                   {:event-type "my-module.created"
+                    :global-sequence (:global-sequence event)
+                    :id (:stream-id event)}))
+        hook   (outbox/make-outbox-hook mapper)
+        messages (atom [])]
+    (append-test-events! "s-mapper"
+                         [{:event-type "test-created" :payload {:name "a"}}
+                          {:event-type "test-updated" :payload {:v 1}}]
+                         :on-events-appended hook)
+    ;; Only test-created should be in the outbox (mapper returns nil for test-updated)
+    (let [rows (outbox-rows)]
+      (is (= 1 (count rows))
+          "Only events where mapper returns non-nil should be recorded"))
+    ;; Verify the published message shape
+    (outbox/poll-and-publish! *ds* (fn [msg] (swap! messages conj msg)) 100)
+    (let [parsed (json/read-str (first @messages) :key-fn keyword)]
+      (is (= "my-module.created" (:event-type parsed)))
+      (is (= "s-mapper" (:id parsed))))))
+
+;; ═══════════════════════════════════════════════════
 ;; Poller lifecycle tests
 ;; ═══════════════════════════════════════════════════
 
@@ -209,6 +241,27 @@
       (is (= 1 (count rows)))
       (is (nil? (:published-at (first rows)))
           "Outbox row should remain unpublished when publish-fn throws"))))
+
+(deftest poll-skips-null-message-rows
+  ;; Simulates a pre-migration outbox row that has no message column value.
+  ;; The poller must skip it (not publish JSON null) and leave it unpublished.
+  (jdbc/with-transaction [tx *ds*]
+    (jdbc/execute-one! tx
+                       ["INSERT INTO events (id, stream_id, stream_sequence, event_type, payload)
+                         VALUES (?, 'test-null', 1, 'test', '{}'::jsonb)"
+                        (store/uuid-v7)])
+    (jdbc/execute-one! tx
+                       ["INSERT INTO event_outbox (global_sequence, message)
+                         VALUES (1, NULL)"]))
+  (let [messages (atom [])
+        n (outbox/poll-and-publish! *ds*
+                                    (fn [msg] (swap! messages conj msg))
+                                    100)]
+    (is (= 0 n) "NULL-message rows must not be published")
+    (is (empty? @messages))
+    ;; Row should remain unpublished so migration backfill can fix it
+    (let [rows (outbox-rows)]
+      (is (nil? (:published-at (first rows)))))))
 
 (deftest poller-publishes-events-asynchronously
   (let [hook     (outbox/make-outbox-hook)

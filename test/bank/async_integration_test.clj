@@ -71,6 +71,8 @@
 ;; Helpers
 ;; ═══════════════════════════════════════════════════
 
+;; Use raw outbox hook (backward compat) — projectors read from
+;; the events table directly, so they don't need integration events.
 (def ^:private outbox-hook (outbox/make-outbox-hook))
 
 (defn- handle-command! [decider-map command]
