@@ -32,9 +32,14 @@ Run quick checks (lint + format + smoke): `bb check`
 
 ## Project Structure
 
-- `es.*` — Reusable event sourcing framework (store, decider, projection, saga, migrations)
-- `bank.*` — Domain-specific code (account, transfer, projections, saga, system composition root)
-- `bank.system` — Composition root that wires framework + domain together
+- `es.*` — Reusable event sourcing framework (store, decider, projection, async-projection, outbox, consumer, saga, rabbitmq, search, component, migrations)
+- `modules.bank.domain.*` — Bank domain (account aggregate, transfer aggregate)
+- `modules.bank.use-cases.*` — Bank use cases / vertical slices (open-account, deposit, withdraw)
+- `modules.bank.infra.*` — Bank infrastructure (projections, saga, integration-events, system, components)
+- `modules.notification.domain.*` — Notification domain (delivery aggregate)
+- `modules.notification.infra.*` — Notification infrastructure (delivery-projection, reactor, components)
+- `events.bank` — Shared integration event schemas (contract between modules)
+- `system` — Full async system composition root (all modules, all infrastructure)
 
 ## Key Commands
 

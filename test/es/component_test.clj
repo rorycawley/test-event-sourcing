@@ -2,7 +2,7 @@
   "Tests for es.component — Component lifecycle management."
   (:require [clojure.test :refer [deftest is]]
             [com.stuartsierra.component :as component]
-            [bank.components :as bank-components]
+            [modules.bank.infra.components :as bank-components]
             [next.jdbc :as jdbc]))
 
 (deftest dev-system-starts-and-stops

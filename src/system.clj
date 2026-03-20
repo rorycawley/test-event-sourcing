@@ -22,12 +22,12 @@
                                   async-projector-component]]
             [es.projection-kit :as kit]
             [es.outbox :as outbox]
-            [bank.account-projection :as account-projection]
-            [bank.transfer-projection :as transfer-projection]
-            [bank.integration-events :as integration-events]
-            [notification.reactor :as reactor]
-            [notification.notification-projection :as notification-projection]
-            [notification.component :as notification]))
+            [modules.bank.infra.account-projection :as account-projection]
+            [modules.bank.infra.transfer-projection :as transfer-projection]
+            [modules.bank.infra.integration-events :as integration-events]
+            [modules.notification.infra.reactor :as reactor]
+            [modules.notification.infra.delivery-projection :as notification-projection]
+            [modules.notification.infra.components :as notification]))
 
 (defn full-system
   "Returns the full Component system with all modules.

@@ -1,7 +1,7 @@
 (ns es.store-integration-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [es.store :as store]
-            [bank.test-support :as support]))
+            [modules.bank.test-support :as support]))
 
 (use-fixtures :once support/with-system)
 (use-fixtures :each support/with-clean-db)

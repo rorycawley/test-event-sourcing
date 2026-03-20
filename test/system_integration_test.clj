@@ -10,7 +10,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [com.stuartsierra.component :as component]
             [system :as system]
-            [bank.account :as account]
+            [modules.bank.domain.account :as account]
             [es.decider :as decider]
             [next.jdbc :as jdbc]))
 
@@ -71,7 +71,9 @@
         (if (seq rows)
           (do
             (is (= 1 (count rows)))
-            (is (= "pending" (:notifications/status (first rows)))))
+            ;; The delivery worker runs concurrently, so the notification
+            ;; may be pending or already sent by the time we read it.
+            (is (contains? #{"pending" "sent"} (:notifications/status (first rows)))))
           (if (> (System/currentTimeMillis) deadline)
             (is false "Timed out waiting for welcome notification projection")
             (do (Thread/sleep 200)
